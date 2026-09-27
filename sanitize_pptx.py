@@ -1,7 +1,7 @@
 
-#python redact_pptx_standalone.py deck.pptx --preview (yellow highlights + CSV report)
-#python redact_pptx_standalone.py deck.pptx (redact with "XXXX")
-#python redact_pptx_standalone.py deck.pptx --keywords.txt names.txt --label "[REDACTED]"
+#python sanitize_pptx.py deck.pptx --preview (yellow highlights + CSV report)
+#python sanitize_pptx.py deck.pptx (redact with "XXXX")
+#python sanitize_pptx.py deck.pptx --keywords names.txt --label "[REDACTED]"
 
 import argparse
 import base64
@@ -143,7 +143,7 @@ def iter_elements(node):
             yield from iter_elements(child)
 
 
-def children(node, ns=None, local=None):
+def children(node, ns=None, local=None) -> list[minidom.Element]:
     return [c for c in node.childNodes if is_el(c, ns, local)]
 
 
@@ -168,10 +168,16 @@ def new_el(like, local):
     return like.ownerDocument.createElementNS(like.namespaceURI, qname)
 
 
-def serialize(doc, original):
+def parse_root(data):
+    root = minidom.parseString(data).documentElement
+    assert root is not None #parseString always yields a root element
+    return root
+
+
+def serialize(root, original):
     m = re.match(rb"\s*(<\?xml[^>]*\?>)", original)
     decl = m.group(1) if m else b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-    return decl + b"\r\n" + doc.documentElement.toxml().encode("utf-8")
+    return decl + b"\r\n" + root.toxml().encode("utf-8")
 
 
 class Job:
@@ -270,8 +276,7 @@ def has_ancestor(el, ns, local):
 
 
 def process_xml(name, data, job, loc):
-    doc = minidom.parseString(data)
-    root = doc.documentElement
+    root = parse_root(data)
     before = len(job.rows)
     changed = False
 
@@ -334,7 +339,7 @@ def process_xml(name, data, job, loc):
                 job.log(loc, "IMAGE_REVIEW_MANUALLY")
 
     if changed or len(job.rows) > before:
-        return serialize(doc, data)
+        return serialize(root, data)
     return data
 
 #package
@@ -344,7 +349,7 @@ def rels_of(z, names, part):
     if rp not in names:
         return []
     out = []
-    for rel in children(minidom.parseString(z.read(rp)).documentElement):
+    for rel in children(parse_root(z.read(rp))):
         if rel.getAttribute("TargetMode") == "External":
             continue
         t = rel.getAttribute("Target")
@@ -360,7 +365,7 @@ def build_locations(z):
     pres = "ppt/presentation.xml"
     if pres in names:
         rid = {i: full for i, _, full in rels_of(z, names, pres)}
-        root = minidom.parseString(z.read(pres)).documentElement
+        root = parse_root(z.read(pres))
         skip = {"slideLayout", "slideMaster", "notesMaster", "theme", "slide"}
         for n, sid in enumerate(root.getElementsByTagNameNS(NS_P, "sldId"), 1):
             slide = rid.get(sid.getAttributeNS(NS_R, "id"))

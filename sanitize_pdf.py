@@ -1,10 +1,9 @@
 
-#python redact_pii.py input.pdf (preview)   --> highlight matches + CSV report, nothing removed
-#python redact_pii.py input.pdf             --> redact with "XXXX" overlay
-#python redact_pii.py input.pdf (keywords)  --> names.txt --label "[REDACTED]"
+#python sanitize_pdf.py input.pdf --preview   --> highlight matches + CSV report, nothing removed
+#python sanitize_pdf.py input.pdf             --> redact with "XXXX" overlay
+#python sanitize_pdf.py input.pdf --keywords names.txt --label "[REDACTED]"
 
-import pandas as pd
-import argparses
+import argparse
 import csv
 import re
 import sys
@@ -138,24 +137,26 @@ def process_page(page, keywords):
 
 
 def main():
-    ap = argparses.ArgumentParser()
+    ap = argparse.ArgumentParser()
     ap.add_argument("pdf")
     ap.add_argument("--preview", action="store_true", help="highlight only, no removal")
     ap.add_argument("--keywords", help="text file, one term per line (client names, codes)")
     ap.add_argument("--label", default="XXXX")
     args = ap.parse_args()
 
-    keywords = open('keywords.txt', 'r')
-    if args.keywords:
-        keywords = [l.strip() for l in Path(args.keywords).read_text(encoding="utf-8").splitlines() if l.strip()]
+    #fall back to keywords.txt in the working folder when --keywords is not given
+    keywords = []
+    kw_file = args.keywords or ("keywords.txt" if Path("keywords.txt").exists() else None)
+    if kw_file:
+        keywords = [l.strip() for l in Path(kw_file).read_text(encoding="utf-8").splitlines() if l.strip()]
 
     src = Path(args.pdf)
     doc = pymupdf.open(src)
     report = []
 
-    for page in doc:
+    for n, page in enumerate(doc.pages(), 1):
         for rule, value, rects in process_page(page, keywords):
-            report.append((page.number + 1, rule, mask(value)))
+            report.append((n, rule, mask(value)))
             for r in rects:
                 if args.preview:
                     page.add_highlight_annot(r)
@@ -173,13 +174,13 @@ def main():
     doc.save(out, garbage=4, deflate=True)
 
     rep = src.with_name(src.stem + suffix + "_report.csv")
-    with open(rep, "w", newline="", encoding="utf-8") as f:
+    with open(rep, "w", newline="", encoding="utf-8-sig") as f: # utf-8-sig opens cleanly in Excel
         w = csv.writer(f)
         w.writerow(["page", "type", "masked_value"])
         w.writerows(report)
 
     print(f"{len(report)} matches -> {out}\nReport -> {rep}")
-    if doc.page_count and not any(p.get_text().strip() for p in doc):
+    if doc.page_count and not any(p.get_text("words") for p in doc):
         print("WARNING: no text layer found. This looks scanned; run OCR first.", file=sys.stderr)
 
 
