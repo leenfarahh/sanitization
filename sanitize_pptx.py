@@ -1,7 +1,8 @@
 
 #python sanitize_pptx.py deck.pptx --preview (yellow highlights + CSV report)
-#python sanitize_pptx.py deck.pptx (redact with IDs + restore key .xlsx that stays with the client)
+#python sanitize_pptx.py deck.pptx (confidential values become XXXX of the same length + restore key .xlsx that stays with the client)
 #python sanitize_pptx.py deck.pptx --keywords names.txt
+#python sanitize_pptx.py deck.pptx --all (mask all text like Xxxx Xxxxxx except slide titles, restorable with the key)
 #python sanitize_pptx.py returned_deck.pptx --restore deck_restore_key.xlsx (put the original values back)
 
 import argparse
@@ -10,6 +11,7 @@ import csv
 import io
 import json
 import posixpath
+import random
 import re
 import secrets
 import zipfile
@@ -130,6 +132,30 @@ def mask(value: str) -> str:
     v = value.strip()
     return "*" * max(0, len(v) - 4) + v[-4:]
 
+#--all masking
+def mask_char(ch):
+    if ch.isdigit():
+        return "٠" if "٠" <= ch <= "٩" else "۰" if "۰" <= ch <= "۹" else "0"
+    if ch.isalpha():
+        return "س" if ARABIC_LETTER.match(ch) else "X" if ch.isupper() else "x"
+    return "⁣" if ch in (MARK_EDGE, MARK_0, MARK_1) else ch #never let the original look like a marker
+
+
+def mask_text(s):
+    return "".join(map(mask_char, s))
+
+
+def marker(n):
+    bits = f"{n:016b}{n % 13:04b}"
+    return MARK_EDGE + "".join(MARK_1 if b == "1" else MARK_0 for b in bits) + MARK_EDGE
+
+
+def read_marker(code):
+    #restore id from a marker, 0 (never used) when the check bits don't match (marker damaged by an edit)
+    bits = "".join("1" if c == MARK_1 else "0" for c in code)
+    n = int(bits[:16], 2)
+    return n if int(bits[16:], 2) == n % 13 else 0
+
 #xml helpers (stdlib minidom)
 
 NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
@@ -139,6 +165,7 @@ NS_S = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 NS_CUSTOM = "http://schemas.openxmlformats.org/officeDocument/2006/custom-properties"
 NS_VT = "http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"
+NS_P14 = "http://schemas.microsoft.com/office/powerpoint/2010/main"
 
 RPR_AFTER_HIGHLIGHT = {"uLnTx", "uLn", "uFillTx", "uFill", "latin", "ea", "cs", "sym",
                        "hlinkClick", "hlinkMouseOver", "rtl", "extLst"}
@@ -151,6 +178,27 @@ CUSTOM_PROPS = "docProps/custom.xml"
 DECK_ID_PROP = "SanitizationID"
 FMTID = "{D5CDD505-2E9C-101B-9397-08002B2CF9AE}"
 LAYOUT_GROWTH = 5 #restored text this many characters longer than its id is flagged for a layout check
+
+#detected values become capital X's, one per character (+971 50 123 4567 -> 16 X's).
+#--all mode: every letter becomes x/X, every digit 0, one character for one so lengths hold.
+#each masked value or text ends with an invisible marker (zero-width characters) holding its restore id: 16-bit id + 4-bit check
+TITLE_PH = {"title", "ctrTitle"} #slide titles stay readable
+CORE_TEXT = {"title", "subject", "keywords", "description", "category", "contentStatus"}
+MARK_EDGE, MARK_0, MARK_1 = "\u2060", "\u200b", "\u200c" #word joiner, zero-width space, zero-width non-joiner
+MARK_RX = re.compile(f"{MARK_EDGE}([{MARK_0}{MARK_1}]{{20}}){MARK_EDGE}")
+ARABIC_LETTER = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFC]")
+#web links can't hold an invisible marker so they point to a placeholder on the reserved .invalid domain
+LINK_HOST = "https://masked.invalid/"
+LINK_RX = re.compile(r"https?://masked\.invalid/(Link\d+)/?", re.I)
+KIND_ORDER = {"x": 0, "id": 0, "mask": 1, "placeholder": 2, "link": 3}
+
+#backup when a marker is lost: the key records where each run of X's sat (slide, item number top to bottom),
+#and restore suggests unmarked runs of the same length there, for a person to confirm
+SLIDE_RX = re.compile(r"ppt/slides/slide\d+\.xml$")
+SHAPES = {"sp", "graphicFrame", "cxnSp", "pic"}
+PH_FAMILY = {"ctrTitle": "title", "subTitle": "body", "obj": "body"}
+ROW_BAND = 91440 #0.1 inch: shapes this close vertically count as one row, read left to right
+XRUN_RX = re.compile(r"(?<![A-Za-z])X+(?![A-Za-z])")
 
 NOTE_TEXT = {
     "IMAGE_REVIEW_MANUALLY": "Has images: text inside images is not redacted, check them by hand",
@@ -229,32 +277,86 @@ def part_path(pkg, name):
 
 
 class Job:
-    def __init__(self, keywords, labels, preview):
-        self.keywords, self.labels, self.preview = keywords, labels, preview
+    def __init__(self, keywords, labels, preview, full=False):
+        self.keywords, self.labels, self.preview, self.full = keywords, labels, preview, full
         self.rows = []
         self.ids, self.entries, self.fields = {}, {}, []
+        self.marks, self.numbers, self.links = {}, {}, {} 
         self.counts, self.placed = Counter(), Counter()
-        self.authors = 0
+        self.authors, self.last_mark = 0, 0
         self.pkg = [] #embedded file being processed, if any
         self.deck_id = None if preview else secrets.token_hex(6)
+        self.rng = random.SystemRandom()
+        self.spots, self.ph_pos = None, {} #X values placed on the current slide, where its placeholders sit
 
     def log(self, loc, kind, value=""):
         self.rows.append((loc, kind, mask(value) if value else ""))
 
-    def token(self, rule, value, loc, numeric=False):
-        #id that replaces value in the deck: same value, same id
+    def place(self, tid, loc):
+        entry = self.entries[tid]
+        if loc not in entry["locations"]:
+            entry["locations"].append(loc)
+        self.placed[tid] += 1
+        return tid
+
+    def new_mark(self):
+        #marker numbers are shared by X values and --all texts
+        self.last_mark += 1
+        if self.last_mark >= 1 << 16:
+            raise SystemExit("Too many different values and texts to mask in one deck (65,535 max)")
+        return self.last_mark
+
+    def xrun(self, rule, value, loc, numeric=False):
+        #detected value -> X's of the same length + invisible marker; same value, same marker.
+        #the key names it by type (PhoneUAE1, Email2...), the deck shows only the X's
         prefix = ID_PREFIX.get(rule) or self.labels.get(value.translate(DIGIT_MAP).lower(), "Keyword")
         tid = self.ids.get((prefix, value))
         if tid is None:
             self.counts[prefix] += 1
             tid = self.ids[prefix, value] = f"{prefix}{self.counts[prefix]}"
-            self.entries[tid] = {"id": tid, "type": rule, "value": value, "locations": [], "numeric": False}
+            self.entries[tid] = {"id": tid, "type": rule, "value": value, "locations": [], "kind": "x",
+                                 "mark": self.new_mark(), "numeric": False, "slots": []}
         entry = self.entries[tid]
         entry["numeric"] |= numeric
-        if loc not in entry["locations"]:
-            entry["locations"].append(loc)
-        self.placed[tid] += 1
-        return tid
+        self.place(tid, loc)
+        return tid, "X" * len(value) + marker(entry["mark"])
+
+    def mark(self, text, loc):
+        #--all: invisible marker for a masked text, same text same marker
+        tid = self.marks.get(text)
+        if tid is None:
+            n = self.new_mark()
+            tid = self.marks[text] = f"Text{n}"
+            self.entries[tid] = {"id": tid, "type": "TEXT", "value": text, "locations": [], "kind": "mask", "mark": n}
+        self.place(tid, loc)
+        return marker(self.entries[tid]["mark"])
+
+    def mask_string(self, s, loc):
+        return mask_text(s) + self.mark(s, loc) if any(ch.isalnum() for ch in s) else s
+
+    def string(self, s, loc):
+        #text outside paragraphs: fully masked in --all mode, pattern redaction otherwise
+        return self.mask_string(s, loc) if self.full else self.redact_string(s, loc)
+
+    def number(self, value, loc):
+        #--all: chart and excel numbers become random placeholders, same number same placeholder.
+        ph = self.numbers.get(value)
+        if ph is None:
+            lo, hi = (101, 999) if len(self.numbers) < 400 else (1001, 9999)
+            ph = str(self.rng.randint(lo, hi))
+            while ph.endswith("0") or ph in self.entries:
+                ph = str(self.rng.randint(lo, hi))
+            self.numbers[value] = ph
+            self.entries[ph] = {"id": ph, "type": "CHART_NUMBER", "value": value, "locations": [], "kind": "placeholder"}
+        return self.place(ph, loc)
+
+    def link(self, target, loc):
+        #web links (--all) and email/phone links point to a placeholder address instead, same address same placeholder
+        tid = self.links.get(target)
+        if tid is None:
+            tid = self.links[target] = f"Link{len(self.links) + 1}"
+            self.entries[tid] = {"id": tid, "type": "LINK", "value": target, "locations": [], "kind": "link"}
+        return LINK_HOST + self.place(tid, loc)
 
     def keep(self, label, type_, value, loc, **target):
         #originals with no text to hold an id (file properties, comment authors)
@@ -270,7 +372,7 @@ class Job:
             self.log(loc, rule, s[start:end])
         if self.preview:
             return s
-        tokens = [self.token(rule, s[start:end], loc, numeric) for start, end, rule in matches]
+        tokens = [self.xrun(rule, s[start:end], loc, numeric)[1] for start, end, rule in matches]
         for (start, end, _), tok in reversed(list(zip(matches, tokens))):
             s = s[:start] + tok + s[end:]
         return s
@@ -349,18 +451,20 @@ def process_paragraph(p, job, loc):
     matches = find_matches(text, job.keywords)
     for start, end, rule in matches:
         job.log(loc, rule, text[start:end])
-    #IDs are assigned left to right, then spliced right to left so offsets stay valid
-    tokens = [None if job.preview else job.token(rule, text[start:end], loc) for start, end, rule in matches]
+    #markers are assigned left to right, then spliced right to left so offsets stay valid
+    tokens = [None if job.preview else job.xrun(rule, text[start:end], loc) for start, end, rule in matches]
     for (start, end, _), tok in reversed(list(zip(matches, tokens))):
         inside, runs = isolate(p, start, end)
         if not runs:
             continue
-        if job.preview:
+        if tok is None:
             for r in runs:
                 if r.localName == "r":
                     add_highlight(r)
         else:
-            replace_span(p, inside, runs, tok)
+            replace_span(p, inside, runs, tok[1])
+            if job.spots is not None:
+                job.spots.append((p, start, tok[0]))
     return bool(matches)
 
 #xml parts
@@ -373,32 +477,162 @@ def has_ancestor(el, ns, local):
     return False
 
 
+def chart_text(el):
+    #chart strings: cached labels and series names, literal strings, plain series names
+    return (has_ancestor(el, NS_C, "strCache") or has_ancestor(el, NS_C, "strLit")
+            or is_el(el.parentNode, NS_C, "tx"))
+
+
+def chart_number(el):
+    return has_ancestor(el, NS_C, "numCache") or has_ancestor(el, NS_C, "numLit")
+
+
+def title_paragraphs(root):
+    #paragraphs inside slide title placeholders, which stay readable in --all mode
+    keep = set()
+    for sp in root.getElementsByTagNameNS(NS_P, "sp"):
+        ph = sp.getElementsByTagNameNS(NS_P, "ph")
+        if ph and ph[0].getAttribute("type") in TITLE_PH:
+            keep.update(sp.getElementsByTagNameNS(NS_A, "p"))
+    return keep
+
+#position on the slide (top to bottom, then left to right), for the backup match
+def xfrm_of(shape):
+    #a:xfrm of a shape (p:spPr), a group (p:grpSpPr) or a table/chart frame (p:xfrm)
+    for c in children(shape, NS_P):
+        if c.localName in ("spPr", "grpSpPr"):
+            return first_child(c, NS_A, "xfrm")
+        if c.localName == "xfrm":
+            return c
+    return None
+
+
+def xy(xfrm, local):
+    #(x, y) of a:off / a:chOff, (cx, cy) of a:ext / a:chExt
+    el = first_child(xfrm, NS_A, local) if xfrm is not None else None
+    if el is None:
+        return None
+    a, b = ("cx", "cy") if local.endswith(("ext", "Ext")) else ("x", "y")
+    return int(el.getAttribute(a) or 0), int(el.getAttribute(b) or 0)
+
+
+def placeholder_positions(z, names, slide):
+    #where the placeholders of a slide's layout (and master) sit, for placeholders that inherit their position
+    parts = [full for _, typ, full in rels_of(z, names, slide) if typ == "slideLayout"][:1]
+    if parts:
+        parts += [full for _, typ, full in rels_of(z, names, parts[0]) if typ == "slideMaster"][:1]
+    pos = {}
+    for part in reversed(parts): #master first, the layout overrides it
+        for sp in parse_root(z.read(part)).getElementsByTagNameNS(NS_P, "sp"):
+            ph, off = sp.getElementsByTagNameNS(NS_P, "ph"), xy(xfrm_of(sp), "off")
+            if ph and off:
+                if ph[0].getAttribute("idx") and part == parts[0]:
+                    pos["idx", ph[0].getAttribute("idx")] = off
+                typ = ph[0].getAttribute("type") or "obj"
+                pos["type", PH_FAMILY.get(typ, typ)] = off
+    return pos
+
+
+def reading_order(p, ph_pos):
+    #(row, x) of the shape holding paragraph p, mapped out of any groups
+    shape = p.parentNode
+    while is_el(shape) and not (shape.namespaceURI == NS_P and shape.localName in SHAPES):
+        shape = shape.parentNode
+    if not is_el(shape):
+        return (0, 0)
+    off = xy(xfrm_of(shape), "off")
+    ph = shape.getElementsByTagNameNS(NS_P, "ph")
+    if off is None and ph:
+        idx, typ = ph[0].getAttribute("idx"), ph[0].getAttribute("type") or "obj"
+        off = (idx and ph_pos.get(("idx", idx))) or ph_pos.get(("type", PH_FAMILY.get(typ, typ)))
+    x, y = off or (0, 0)
+    grp = shape.parentNode
+    while is_el(grp, NS_P, "grpSp"):
+        g = xfrm_of(grp)
+        (gx, gy), (ox, oy) = xy(g, "off") or (0, 0), xy(g, "chOff") or (0, 0)
+        (gw, gh), (cw, ch) = xy(g, "ext") or (1, 1), xy(g, "chExt") or (1, 1)
+        x, y = gx + (x - ox) * gw // (cw or 1), gy + (y - oy) * gh // (ch or 1)
+        grp = grp.parentNode
+    return (round(y / ROW_BAND), x)
+
+
+def slide_no(loc):
+    m = re.fullmatch(r"Slide (\d+)", loc or "")
+    return int(m.group(1)) if m else None
+
+
+def mask_paragraph(p, job, loc):
+    #--all: runs become x/X/0 in place. an invisible marker after the last run carries the restore id
+    ts = [first_child(r, NS_A, "t") for r in children(p, NS_A, "r")]
+    ts = [t for t in ts if t is not None]
+    text = "".join(get_text(t) for t in ts)
+    if not any(ch.isalnum() for ch in text):
+        return False
+    for t in ts:
+        set_text(t, mask_text(get_text(t)))
+    set_text(ts[-1], get_text(ts[-1]) + job.mark(text, loc))
+    return True
+
+
 def process_xml(name, data, job, loc):
     root = parse_root(data)
-    before = len(job.rows)
+    before = len(job.rows) + sum(job.placed.values())
     changed = False
 
     if name.endswith(".rels"):
         for rel in children(root):
             t = rel.getAttribute("Target")
-            if rel.getAttribute("TargetMode") == "External" and t.lower().startswith(("mailto:", "tel:")):
-                rel.setAttribute("Target", job.redact_string(t, loc + " (hyperlink)"))
+            if rel.getAttribute("TargetMode") != "External" or not t:
+                continue
+            here = loc + " (hyperlink)"
+            if t.lower().startswith(("mailto:", "tel:")): #a link address can't hold a marker, so it gets a placeholder
+                matches = find_matches(t, job.keywords)
+                for start, end, rule in matches:
+                    job.log(here, rule, t[start:end])
+                if job.full or matches and not job.preview:
+                    rel.setAttribute("Target", job.link(t, here))
+            elif job.full and rel.getAttribute("Type").endswith("/hyperlink"): #web and file links
+                rel.setAttribute("Target", job.link(t, here))
     else:
-        for p in root.getElementsByTagNameNS(NS_A, "p"):
-            changed |= process_paragraph(p, job, loc)
+        titles = title_paragraphs(root) if job.full else set()
+        slide = bool(SLIDE_RX.match(name)) and not job.pkg and slide_no(loc) is not None
+        paras = root.getElementsByTagNameNS(NS_A, "p")
+        job.spots = [] if slide else None
+        for p in paras:
+            if job.full and p not in titles:
+                changed |= mask_paragraph(p, job, loc)
+            else:
+                changed |= process_paragraph(p, job, loc)
+        if job.spots:
+            #number the X values on this slide top to bottom, for the backup match
+            index = {p: i for i, p in enumerate(paras)}
+            ranked = sorted(job.spots, key=lambda s: (reading_order(s[0], job.ph_pos), index[s[0]], s[1]))
+            for k, (_, _, tid) in enumerate(ranked, 1):
+                job.entries[tid]["slots"].append([slide_no(loc), k])
+        job.spots = None
 
         for el in list(iter_elements(root)):
             ln, ns = el.localName, el.namespaceURI
             if ln == "cNvPr": #alt text
                 for attr in ("descr", "title"):
                     if el.getAttribute(attr):
-                        el.setAttribute(attr, job.redact_string(el.getAttribute(attr), loc + " (alt text)"))
-            elif ns == NS_C and ln == "v" and has_ancestor(el, NS_C, "strCache"):
-                set_text(el, job.redact_string(get_text(el), loc + " (chart labels)"))
+                        el.setAttribute(attr, job.string(el.getAttribute(attr), loc + " (alt text)"))
+            elif ns == NS_C and ln == "v" and chart_text(el):
+                set_text(el, job.string(get_text(el), loc + " (chart labels)"))
+            elif ns == NS_C and ln == "v" and job.full and get_text(el).strip() and chart_number(el):
+                set_text(el, job.number(get_text(el), loc + " (chart data)"))
             elif ns == NS_P and ln == "text": #legacy comments
-                set_text(el, job.redact_string(get_text(el), loc + " (comment)"))
+                set_text(el, job.string(get_text(el), loc + " (comment)"))
             elif ns == NS_S and ln == "t": #excel strings
-                set_text(el, job.redact_string(get_text(el), loc))
+                set_text(el, job.string(get_text(el), loc))
+            elif ns == NS_S and ln == "c" and el.getAttribute("t") in ("", "n") and job.full: #every Excel number
+                v = first_child(el, NS_S, "v")
+                if v is not None and get_text(v):
+                    set_text(v, job.number(get_text(v), loc))
+            elif ns == NS_P14 and ln == "section" and job.full and el.getAttribute("name"): #slide section names
+                el.setAttribute("name", job.mask_string(el.getAttribute("name"), "Sections"))
+            elif ln in ("hlinkClick", "hlinkMouseOver") and job.full and el.getAttribute("tooltip"): #link screentips
+                el.setAttribute("tooltip", job.mask_string(el.getAttribute("tooltip"), loc + " (link screentip)"))
             elif (ns == NS_S and ln == "c" and el.getAttribute("t") in ("", "n")
                   and first_child(el, NS_S, "f") is None): #numeric Excel cell
                 v = first_child(el, NS_S, "v")
@@ -432,16 +666,19 @@ def process_xml(name, data, job, loc):
                             job.keep("(file property)", kind, get_text(el), loc,
                                      kind="property", part=name, el=el.localName, ns=el.namespaceURI)
                             set_text(el, "")
+                    elif job.full and (name.endswith("core.xml") and el.localName in CORE_TEXT
+                                       or name.endswith("custom.xml") and is_el(el, NS_VT) and el.localName in ("lpwstr", "bstr")):
+                        set_text(el, job.mask_string(get_text(el), "File properties"))
                     else:
                         set_text(el, job.redact_string(get_text(el), "File properties"))
 
-        if re.match(r"ppt/slides/slide\d+\.xml$", name):
+        if SLIDE_RX.match(name):
             if root.getAttribute("show") == "0":
                 job.log(loc, "HIDDEN_SLIDE")
             if root.getElementsByTagNameNS(NS_A, "blip"):
                 job.log(loc, "IMAGE_REVIEW_MANUALLY")
 
-    if changed or len(job.rows) > before:
+    if changed or len(job.rows) + sum(job.placed.values()) > before:
         return serialize(root, data)
     return data
 
@@ -586,6 +823,8 @@ def process_package(data, job, parent_loc=None):
     for name in sorted(files, key=lambda n: slide_key(loc_of(n))):
         blob, loc = zin.read(name), loc_of(name)
         if name.endswith((".xml", ".rels")) and name != "[Content_Types].xml":
+            slide = parent_loc is None and SLIDE_RX.match(name)
+            job.ph_pos = placeholder_positions(zin, names, name) if slide else {}
             blob = job.xml(name, blob, loc)
         elif name.lower().endswith(EMBEDDED_OOXML):
             job.pkg.append(name)
@@ -606,14 +845,60 @@ def process_package(data, job, parent_loc=None):
 #restore
 class Restore:
     def __init__(self, entries, fields=()):
-        self.entries = {e["id"].lower(): e for e in entries}
+        kind = lambda k: [e for e in entries if e.get("kind", "id") == k]
+        self.entries = {e["id"].lower(): e for e in kind("id")} #keys from before X's: IDs like PhoneUAE1 in the deck
+        self.marks = {e["mark"]: e for e in kind("x") + kind("mask")}
+        self.nums = {e["id"]: e for e in kind("placeholder")}
+        self.links = {e["id"].lower(): e for e in kind("link")}
         ids = sorted(self.entries, key=len, reverse=True) #longest first, so PhoneUAE12 wins over PhoneUAE1
         self.rx = re.compile("(?:" + "|".join(map(re.escape, ids)) + r")(?![0-9])", re.I) if ids else None
         self.fields = [f for f in fields if f["restore"]]
         self.done = set() #indices of fields put back
         self.found, self.restored = Counter(), Counter()
-        self.layout = set()
-        self.pkg, self.deck_id, self.dirty = [], None, False
+        self.layout, self.edited = set(), set()
+        self.xruns = [] #runs of X's seen on the slides, for the backup match
+        self.pkg, self.deck_id, self.dirty, self.ph_pos = [], None, False, {}
+
+    def plan(self, text, loc):
+        #per-character replacements for text holding markers, keeping the designer's formatting
+        new, start = list(text), 0
+        for m in MARK_RX.finditer(text):
+            seg, start = start, m.end()
+            e = self.marks.get(read_marker(m.group(1)))
+            if e is None:
+                continue
+            self.found[e["id"]] += 1
+            if not e["restore"]:
+                continue
+            new[m.start():m.end()] = [""] * (m.end() - m.start())
+            masked, before = masked_form(e), text[seg:m.start()]
+            if before.lower().endswith(masked.lower()): #anything the designer typed before it is kept
+                new[m.start() - len(masked):m.start()] = list(e["value"])
+            else:
+                #edited: an X value loses the X's just before its marker, an --all text everything since the last marker
+                begin = m.start() - (len(before) - len(before.rstrip("Xx"))) if e["kind"] == "x" else seg
+                new[begin:m.start()] = [""] * (m.start() - begin)
+                new[m.start()] = e["value"]
+                self.edited.add(loc)
+            self.restored[e["id"]] += 1
+            self.dirty = True
+        return new
+
+    def unmask(self, s, loc):
+        return "".join(self.plan(s, loc)) if MARK_EDGE in s else s
+
+    def target(self, t):
+        #link targets: a --all placeholder goes back whole, IDs inside other targets (mailto:Email1) are swapped
+        m = LINK_RX.fullmatch(t.strip())
+        e = self.links.get(m.group(1).lower()) if m else None
+        if e is None:
+            return self.swap(t)
+        self.found[e["id"]] += 1
+        if not e["restore"]:
+            return t
+        self.restored[e["id"]] += 1
+        self.dirty = True
+        return e["value"]
 
     def hits(self, text):
         #count every ID in text, return the ones marked for restore
@@ -652,12 +937,79 @@ def restore_paragraph(p, rj, loc):
             rj.layout.add(loc)
 
 
+def masked_form(e):
+    #what a marked entry looked like in the redacted deck, before its marker
+    return "X" * len(e["value"]) if e["kind"] == "x" else mask_text(e["value"])
+
+
+def collect_xruns(root, rj, loc):
+    #every run of capital X's on a slide, marked or not, with its reading position; runs inside --all text are skipped
+    for i, p in enumerate(root.getElementsByTagNameNS(NS_A, "p")):
+        text = "".join(s[3] for s in segments(p))
+        if "X" not in text:
+            continue
+        owners = [rj.marks.get(read_marker(code)) for code in MARK_RX.findall(text)]
+        in_mask = any(e is not None and e["kind"] == "mask" for e in owners)
+        order = reading_order(p, rj.ph_pos)
+        for m in XRUN_RX.finditer(text):
+            mk = MARK_RX.match(text, m.end())
+            e = rj.marks.get(read_marker(mk.group(1))) if mk else None
+            if e is not None and e["kind"] == "mask" or e is None and in_mask:
+                continue
+            rj.xruns.append({"loc": loc, "pos": (order, i, m.start()), "len": m.end() - m.start(), "entry": e})
+
+
+def suggestions(rj, e):
+    #unmarked runs of X's as long as a lost value: same slide and item first, then same slide, then elsewhere,
+    #nearest to where it was first (slides added or removed shift the numbers)
+    slots = {tuple(s) for s in e.get("slots", [])}
+    slides = {s[0] for s in slots}
+    ranked = []
+    for r in rj.xruns:
+        if r["entry"] is None and r["len"] == len(e["value"]):
+            n, k = slide_no(r["loc"]), r["item"]
+            near = min(((abs(n - s), abs(k - i)) for s, i in slots), default=(0, 0))
+            ranked.append((0 if (n, k) in slots else 1 if n in slides else 2, near, n, k))
+    return [(rank, n, k) for rank, _, n, k in sorted(ranked)[:3]]
+
+
+def restore_masked_paragraph(p, rj, loc):
+    ts = [first_child(r, NS_A, "t") for r in children(p, NS_A, "r")]
+    ts = [t for t in ts if t is not None]
+    text = "".join(get_text(t) for t in ts)
+    if MARK_EDGE not in text:
+        return
+    new, pos = rj.plan(text, loc), 0
+    for t in ts: #runs may have been split or restyled by the designer, each keeps its own formatting
+        n = len(get_text(t))
+        set_text(t, "".join(new[pos:pos + n]))
+        pos += n
+
+
+def restore_placeholder(v, rj):
+    #--all: chart and Excel placeholders go back to the original numbers
+    e = rj.nums.get(get_text(v).strip()) if v is not None else None
+    if e is None:
+        return
+    rj.found[e["id"]] += 1
+    if e["restore"]:
+        set_text(v, e["value"])
+        rj.restored[e["id"]] += 1
+        rj.dirty = True
+
+
 def restore_number(c, rj):
-    #an Excel number that became text on redaction goes back to a number
+    #an excel number that became text on redaction goes back to a number, when its X's are untouched
     text = "".join(get_text(t) for t in c.getElementsByTagNameNS(NS_S, "t"))
-    m = rj.rx.fullmatch(text.translate(DIGIT_MAP)) if rj.rx else None
-    e = m and rj.entries[m.group().lower()]
-    if not (e and e["numeric"] and e["restore"]):
+    m = MARK_RX.search(text)
+    if m:
+        e = rj.marks.get(read_marker(m.group(1)))
+        if not (e and m.end() == len(text) and text[:m.start()].upper() == masked_form(e)):
+            return
+    else: #keys from before X's
+        m = rj.rx.fullmatch(text.translate(DIGIT_MAP)) if rj.rx else None
+        e = m and rj.entries[m.group().lower()]
+    if not (e and e.get("numeric") and e["restore"]):
         return
     for is_ in children(c, NS_S, "is"):
         c.removeChild(is_)
@@ -702,23 +1054,34 @@ def restore_xml(name, data, rj, loc):
     if name.endswith(".rels"):
         for rel in children(root):
             if rel.getAttribute("TargetMode") == "External":
-                rel.setAttribute("Target", rj.swap(rel.getAttribute("Target")))
+                rel.setAttribute("Target", rj.target(rel.getAttribute("Target")))
     else:
-        #paragraphs first, so IDs split across differently formatted runs still match
+        if SLIDE_RX.match(name) and not rj.pkg and slide_no(loc) is not None:
+            collect_xruns(root, rj, loc) #before anything is restored
+        #paragraphs first, so values split across differently formatted runs still match
         for p in root.getElementsByTagNameNS(NS_A, "p"):
             restore_paragraph(p, rj, loc)
+            restore_masked_paragraph(p, rj, loc)
         for el in list(iter_elements(root)):
             if is_el(el, NS_S, "c") and el.getAttribute("t") == "inlineStr":
                 restore_number(el, rj)
+            elif is_el(el, NS_S, "c") and el.getAttribute("t") in ("", "n"):
+                restore_placeholder(first_child(el, NS_S, "v"), rj)
+            elif is_el(el, NS_C, "v") and chart_number(el):
+                restore_placeholder(el, rj)
         for el in list(iter_elements(root)):
             if el.localName == "cNvPr":
                 for attr in ("descr", "title"):
                     if el.getAttribute(attr):
-                        el.setAttribute(attr, rj.swap(el.getAttribute(attr)))
+                        el.setAttribute(attr, rj.unmask(rj.swap(el.getAttribute(attr)), loc))
+            elif is_el(el, NS_P14, "section") and el.getAttribute("name"):
+                el.setAttribute("name", rj.unmask(el.getAttribute("name"), loc))
+            elif el.localName in ("hlinkClick", "hlinkMouseOver") and el.getAttribute("tooltip"):
+                el.setAttribute("tooltip", rj.unmask(el.getAttribute("tooltip"), loc))
             if not is_el(el, NS_A, "t"): #a:t was handled with its paragraph
                 for c in el.childNodes:
                     if isinstance(c, minidom.Text): #cdata sections are Text too
-                        c.data = rj.swap(c.data)
+                        c.data = rj.unmask(rj.swap(c.data), loc)
 
         path = part_path(rj.pkg, name)
         for i, f in enumerate(rj.fields):
@@ -850,11 +1213,34 @@ def id_order(entry):
     return (m.group(1), int(m.group(2))) if m else (entry["id"], 0)
 
 
+def entry_details(e, count):
+    #marker number, places redacted, number flag and slide positions (slide, item) as JSON, for restore
+    d = {"kind": e["kind"]}
+    if "mark" in e:
+        d["mark"], d["count"] = e["mark"], count
+    if e.get("numeric"):
+        d["numeric"] = True
+    if e.get("slots"):
+        d["slots"] = e["slots"]
+    return json.dumps(d)
+
+
+def where(e):
+    #Locations column: "Slide 2 (item 3); Slide 5 notes", items numbered top to bottom on each slide
+    items = {}
+    for n, k in e.get("slots", []):
+        items.setdefault(n, []).append(str(k))
+    out = []
+    for loc in sorted(e["locations"], key=slide_key):
+        ks = items.get(slide_no(loc))
+        out.append(f"{loc} (item{'s' if len(ks) > 1 else ''} {', '.join(ks)})" if ks else loc)
+    return "; ".join(out)
+
+
 def write_key(path, job, src):
     rows = [KEY_HEADER]
-    for e in sorted(job.entries.values(), key=id_order):
-        rows.append([e["id"], e["type"], e["value"], "; ".join(sorted(e["locations"], key=slide_key)), "Y",
-                     json.dumps({"kind": "number"}) if e["numeric"] else ""])
+    for e in sorted(job.entries.values(), key=lambda e: (KIND_ORDER[e["kind"]], id_order(e))):
+        rows.append([e["id"], e["type"], e["value"], where(e), "Y", entry_details(e, job.placed[e["id"]])])
     for f in job.fields:
         rows.append([f["id"], f["type"], f["value"], "; ".join(f["locations"]), "Y", json.dumps(f["target"])])
     notes = [["Location", "Note"]] + [
@@ -864,6 +1250,10 @@ def write_key(path, job, src):
              ["Source deck", src.name],
              ["Redacted on", datetime.now().strftime("%d/%m/%Y %H:%M")],
              ["Deck ID", job.deck_id],
+             ["Mode", "All text masked except slide titles (--all)" if job.full
+                      else "Confidential details replaced with X's of the same length"],
+             ["Items", "X's on a slide are numbered top to bottom (item 1 is highest). If a value's invisible marker "
+                       "is lost, restore suggests runs of X's with the same length and position, to check by hand."],
              ["Keep this file", "It holds the original values. Keep it on this machine and never send it with the deck."],
              ["To restore", f"python sanitize_pptx.py <returned deck>.pptx --restore {path.name}"],
              ["Restore only some items", "Set Restore (Y/N) to N for anything that should stay redacted."]]
@@ -885,10 +1275,16 @@ def read_key(path):
         target = json.loads(details) if details else {}
         item = {"id": get("ID").strip(), "type": get("Type"), "value": get("Original value"),
                 "restore": not get("Restore (Y/N)").strip().upper().startswith("N")}
-        if target.get("kind") in ("property", "author"):
+        kind = target.get("kind")
+        if kind in ("property", "author"):
             fields.append({**item, "target": target})
         else:
-            entries.append({**item, "numeric": target.get("kind") == "number"})
+            e = {**item, "kind": kind if kind in ("x", "mask", "placeholder", "link") else "id",
+                 "numeric": kind == "number" or bool(target.get("numeric")), "slots": target.get("slots", []),
+                 "count": target.get("count", 0)}
+            if e["kind"] in ("x", "mask"): #--all keys from before the mark field: Text<n>
+                e["mark"] = int(target.get("mark") or e["id"].removeprefix("Text"))
+            entries.append(e)
     about = {r[0]: r[1] for r in sheets.get("About", [])[1:] if len(r) > 1}
     return entries, fields, about.get("Deck ID")
 
@@ -912,7 +1308,7 @@ def load_keywords(path):
 def redact(args):
     keywords, labels = load_keywords(args.keywords) if args.keywords else ([], {})
     src = Path(args.pptx)
-    job = Job(keywords, labels, args.preview)
+    job = Job(keywords, labels, args.preview, args.all)
     result = process_package(src.read_bytes(), job)
 
     suffix = "_preview" if args.preview else "_redacted"
@@ -933,17 +1329,24 @@ def redact(args):
     key_dir.mkdir(parents=True, exist_ok=True)
     key = key_dir / (src.stem + "_restore_key.xlsx")
     write_key(key, job, src)
-    print(f"{found} items redacted as {len(job.entries)} IDs, {len(job.rows) - found} review notes -> {out}")
+    kinds = Counter(e["kind"] for e in job.entries.values())
+    if job.full:
+        print(f"{kinds['mask']} texts masked, {kinds['x']} values in titles masked with X's, "
+              f"{kinds['placeholder']} chart numbers replaced, {kinds['link']} links masked, "
+              f"{len(job.rows) - found} review notes -> {out}")
+    else:
+        print(f"{found} items masked with X's ({kinds['x']} different values, {kinds['link']} email/phone links), "
+              f"{len(job.rows) - found} review notes -> {out}")
     print(f"Restore key -> {key}\nKeep the key on this machine. Send only the redacted deck.")
 
-    #self-check: every id must be found again exactly as often as it was placed
+    #self-check: every marker and placeholder must be found again exactly as often as it was placed
     check = Restore([{**e, "restore": True} for e in job.entries.values()])
     process_package(result, check)
     off = [(i, n, check.found[i]) for i, n in job.placed.items() if check.found[i] != n]
     if off:
-        print("WARNING: these ids will not restore cleanly:")
+        print("WARNING: these items will not restore cleanly:")
         for i, placed, seen in off:
-            why = "the deck already contains this text" if seen > placed else "it touches letters or digits next to it"
+            why = "the deck already had redaction markers, was it redacted before?" if seen > placed else "could not be read back"
             print(f"  {i}: placed {placed}, found {seen} ({why})")
 
 
@@ -967,14 +1370,42 @@ def restore(args):
     wanted = [e["id"] for e in entries if e["restore"]]
     missing = [i for i in wanted if not rj.restored[i]]
     kept = [e["id"] for e in entries if not e["restore"]]
-    print(f"Restored {len(wanted) - len(missing)} of {len(wanted)} IDs "
+    short = lambda items: ", ".join(items[:20]) + (f" and {len(items) - 20} more" if len(items) > 20 else "")
+    print(f"Restored {len(wanted) - len(missing)} of {len(wanted)} items "
           f"({sum(rj.restored.values())} places) -> {out}")
     if wanted and len(missing) == len(wanted):
-        print("WARNING: none of the key's IDs were found. Is this the right deck and key?")
+        print("WARNING: none of the key's items were found. Is this the right deck and key?")
     elif missing:
-        print("Not found, restore by hand (see Locations in the key): " + ", ".join(missing))
+        print("Not found, restore by hand (see Locations in the key): " + short(missing))
+    partial = [e for e in entries if e["restore"] and 0 < rj.restored[e["id"]] < e.get("count", 0)]
+    if partial:
+        print("Restored in fewer places than redacted (a marker was lost, or a copy was removed): "
+              + short([f"{e['id']} ({rj.restored[e['id']]} of {e['count']})" for e in partial]))
+    lost = [e for e in entries if e["kind"] == "x" and (e["id"] in missing or e in partial)]
+    if lost and len(missing) < len(wanted):
+        #backup: number every run of X's per slide top to bottom, then match lost values by length and position
+        by_slide = {}
+        for r in rj.xruns:
+            by_slide.setdefault(r["loc"], []).append(r)
+        for runs in by_slide.values():
+            for k, r in enumerate(sorted(runs, key=lambda r: r["pos"]), 1):
+                r["item"] = k
+        lines = []
+        for e in lost:
+            hits = suggestions(rj, e)
+            if hits:
+                was = ", ".join(f"Slide {n} item {k}" for n, k in e["slots"]) or where(e)
+                tag = {0: " (same slide and position)", 1: " (same slide)", 2: ""}
+                lines.append(f"  {e['id']} ({len(e['value'])} characters, was {was}): "
+                             + ", ".join(f"Slide {n} item {k}{tag[rank]}" for rank, n, k in hits))
+        if lines:
+            print("Possible matches by length and position, unmarked X's (check before restoring by hand):")
+            print("\n".join(lines[:20]) + (f"\n  and {len(lines) - 20} more" if len(lines) > 20 else ""))
     if kept:
-        print("Kept redacted (Restore = N): " + ", ".join(kept))
+        print("Kept redacted (Restore = N): " + short(kept))
+    if rj.edited:
+        print("Masked text was edited here, the original was put back in full (check wording and formatting): "
+              + ", ".join(sorted(rj.edited, key=slide_key)))
     if rj.fields:
         left = [f for i, f in enumerate(rj.fields) if i not in rj.done]
         print(f"File properties and comment authors restored: {len(rj.fields) - len(left)} of {len(rj.fields)}")
@@ -988,11 +1419,16 @@ def main():
     ap = argparse.ArgumentParser(description="Rule-based PII redaction for .pptx (no dependencies)")
     ap.add_argument("pptx")
     ap.add_argument("--preview", action="store_true", help="highlight only, no removal")
-    ap.add_argument("--keywords", help="text file, one term per line; 'term | Label' names its ID")
+    ap.add_argument("--all", action="store_true",
+                    help="mask all text except slide titles (letters -> x/X, digits -> 0), "
+                         "chart numbers become placeholders; restorable with the key")
+    ap.add_argument("--keywords", help="text file, one term per line; 'term | Label' names it in the key")
     ap.add_argument("--key-dir", help="folder for the restore key (default: next to the deck)")
     ap.add_argument("--restore", metavar="KEY", help="put the original values back using this restore key (.xlsx)")
     ap.add_argument("--force", action="store_true", help="restore even if the key was made for a different deck")
     args = ap.parse_args()
+    if args.all and args.preview:
+        ap.error("--all cannot be combined with --preview")
     if args.restore:
         restore(args)
     else:
