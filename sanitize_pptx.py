@@ -2,7 +2,7 @@
 #python sanitize_pptx.py deck.pptx --preview (yellow highlights + CSV report)
 #python sanitize_pptx.py deck.pptx (confidential values become XXXX of the same length + restore key .xlsx that stays with the client)
 #python sanitize_pptx.py deck.pptx --keywords names.txt
-#python sanitize_pptx.py deck.pptx --all (mask all text like Xxxx Xxxxxx except slide titles, restorable with the key)
+#python sanitize_pptx.py deck.pptx --all (all text becomes Lorem ipsum, numbers XX, chart labels XX/yy, except slide titles, restorable with the key)
 #python sanitize_pptx.py returned_deck.pptx --restore deck_restore_key.xlsx (put the original values back)
 
 import argparse
@@ -14,6 +14,7 @@ import posixpath
 import random
 import re
 import secrets
+import unicodedata
 import zipfile
 from collections import Counter
 from datetime import datetime
@@ -134,15 +135,77 @@ def mask(value: str) -> str:
 
 #--all masking
 def mask_char(ch):
-    if ch.isdigit():
-        return "٠" if "٠" <= ch <= "٩" else "۰" if "۰" <= ch <= "۹" else "0"
-    if ch.isalpha():
-        return "س" if ARABIC_LETTER.match(ch) else "X" if ch.isupper() else "x"
     return "⁣" if ch in (MARK_EDGE, MARK_0, MARK_1) else ch #never let the original look like a marker
 
 
+def in_word(s, i, start):
+    #letters and digits, plus accents inside a word (مُعَدّل), apostrophes and zero-width joiners between letters (don't),
+    #decimal and thousands separators between digits (1,250.5)
+    ch = s[i]
+    if ch.isalnum():
+        return True
+    if i == start:
+        return False
+    if unicodedata.category(ch)[0] == "M":
+        return True
+    prev, nxt = s[i - 1], s[i + 1] if i + 1 < len(s) else ""
+    if ch in "'’‌‍":
+        return prev.isalpha() and nxt.isalpha()
+    return ch in ".,٫٬" and prev.isnumeric() and nxt.isnumeric()
+
+
+def has_number(s):
+    return any(c.isnumeric() for c in s)
+
+
+def split_numbers(w):
+    #a word of 4+ letters written against a number stays a word (النفطية54.7 -> lorem + XX, often two runs),
+    #shorter letters go with the number (Q3, 4.14m, FY2026)
+    short = lambda p: not has_number(p) and sum(c.isalpha() for c in p) < 4
+    out = []
+    for p in re.findall(r"\D+|\d[\d.,٫٬]*", w):
+        if out and (short(p) or short(out[-1])) and (has_number(p) or has_number(out[-1])):
+            out[-1] += p
+        else:
+            out.append(p)
+    return out
+
+
+def mask_tokens(s):
+    #(original, masked) pieces of a text: the words become lorem ipsum in order, again and again, numbers XX
+    #(25, 1,250.5, Q3), the rest stays. restore pairs them back up, so lengths don't have to match
+    out, k, i = [], 0, 0
+    while i < len(s):
+        j = i
+        while j < len(s) and in_word(s, j, i):
+            j += 1
+        if j == i:
+            out.append((s[i], mask_char(s[i])))
+            i += 1
+            continue
+        for orig in split_numbers(s[i:j]):
+            if has_number(orig):
+                out.append((orig, "XX"))
+                continue
+            word = LOREM[k % len(LOREM)]
+            cased = [c for c in orig if c.lower() != c.upper()]
+            if len(cased) > 1 and all(c.isupper() for c in cased):
+                word = word.upper()
+            elif cased and cased[0].isupper() or not cased and k == 0: #scripts without capitals: first word only
+                word = word.capitalize()
+            out.append((orig, word))
+            k += 1
+        i = j
+    return out
+
+
 def mask_text(s):
-    return "".join(map(mask_char, s))
+    return "".join(m for _, m in mask_tokens(s))
+
+
+def mask_label(s):
+    #chart labels and the chart data behind them: XX, or yy for a label that is only a number (2024)
+    return "XX" if any(c.isalpha() for c in s) else "yy"
 
 
 def marker(n):
@@ -177,16 +240,19 @@ EMBEDDED_OOXML = (".xlsx", ".xlsm", ".docx", ".pptx")
 CUSTOM_PROPS = "docProps/custom.xml"
 DECK_ID_PROP = "SanitizationID"
 FMTID = "{D5CDD505-2E9C-101B-9397-08002B2CF9AE}"
-LAYOUT_GROWTH = 5 #restored text this many characters longer than its id is flagged for a layout check
+LAYOUT_GROWTH = 5 #restored text this many characters longer than what was on the slide is flagged for a layout check
 
 #detected values become capital X's, one per character (+971 50 123 4567 -> 16 X's).
-#--all mode: every letter becomes x/X, every digit 0, one character for one so lengths hold.
+#--all mode: the words become lorem ipsum in order (arabic too), numbers XX, chart labels XX or yy; restore pairs each word back with its original.
 #each masked value or text ends with an invisible marker (zero-width characters) holding its restore id: 16-bit id + 4-bit check
 TITLE_PH = {"title", "ctrTitle"} #slide titles stay readable
 CORE_TEXT = {"title", "subject", "keywords", "description", "category", "contentStatus"}
 MARK_EDGE, MARK_0, MARK_1 = "\u2060", "\u200b", "\u200c" #word joiner, zero-width space, zero-width non-joiner
 MARK_RX = re.compile(f"{MARK_EDGE}([{MARK_0}{MARK_1}]{{20}}){MARK_EDGE}")
-ARABIC_LETTER = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFC]")
+LOREM = ("lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore "
+         "magna aliqua ut enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo "
+         "consequat duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur "
+         "excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserunt mollit anim id est laborum").split()
 #web links can't hold an invisible marker so they point to a placeholder on the reserved .invalid domain
 LINK_HOST = "https://masked.invalid/"
 LINK_RX = re.compile(r"https?://masked\.invalid/(Link\d+)/?", re.I)
@@ -321,22 +387,25 @@ class Job:
         self.place(tid, loc)
         return tid, "X" * len(value) + marker(entry["mark"])
 
-    def mark(self, text, loc):
+    def mark(self, text, loc, style="lorem"):
         #--all: invisible marker for a masked text, same text same marker
-        tid = self.marks.get(text)
+        tid = self.marks.get((style, text))
         if tid is None:
             n = self.new_mark()
-            tid = self.marks[text] = f"Text{n}"
-            self.entries[tid] = {"id": tid, "type": "TEXT", "value": text, "locations": [], "kind": "mask", "mark": n}
+            tid = self.marks[style, text] = f"Text{n}"
+            self.entries[tid] = {"id": tid, "type": "CHART_LABEL" if style == "label" else "TEXT", "value": text,
+                                 "locations": [], "kind": "mask", "mark": n, "style": style}
         self.place(tid, loc)
         return marker(self.entries[tid]["mark"])
 
-    def mask_string(self, s, loc):
-        return mask_text(s) + self.mark(s, loc) if any(ch.isalnum() for ch in s) else s
+    def mask_string(self, s, loc, label=False):
+        if not any(ch.isalnum() for ch in s):
+            return s
+        return (mask_label(s) if label else mask_text(s)) + self.mark(s, loc, "label" if label else "lorem")
 
-    def string(self, s, loc):
-        #text outside paragraphs: fully masked in --all mode, pattern redaction otherwise
-        return self.mask_string(s, loc) if self.full else self.redact_string(s, loc)
+    def string(self, s, loc, label=False):
+        #text outside paragraphs: fully masked in --all mode (chart labels XX/yy), pattern redaction otherwise
+        return self.mask_string(s, loc, label) if self.full else self.redact_string(s, loc)
 
     def number(self, value, loc):
         #--all: chart and excel numbers become random placeholders, same number same placeholder.
@@ -562,14 +631,25 @@ def slide_no(loc):
 
 
 def mask_paragraph(p, job, loc):
-    #--all: runs become x/X/0 in place. an invisible marker after the last run carries the restore id
+    #--all: runs become lorem ipsum/X in place. an invisible marker after the last run carries the restore id
     ts = [first_child(r, NS_A, "t") for r in children(p, NS_A, "r")]
     ts = [t for t in ts if t is not None]
     text = "".join(get_text(t) for t in ts)
     if not any(ch.isalnum() for ch in text):
         return False
+    #masked as one text, each masked word goes into the run its original starts in
+    ends, pos, i, out = [], 0, 0, [""] * len(ts)
     for t in ts:
-        set_text(t, mask_text(get_text(t)))
+        pos += len(get_text(t))
+        ends.append(pos)
+    pos = 0
+    for orig, shown in mask_tokens(text):
+        while pos >= ends[i]:
+            i += 1
+        out[i] += shown
+        pos += len(orig)
+    for t, s in zip(ts, out):
+        set_text(t, s)
     set_text(ts[-1], get_text(ts[-1]) + job.mark(text, loc))
     return True
 
@@ -618,13 +698,13 @@ def process_xml(name, data, job, loc):
                     if el.getAttribute(attr):
                         el.setAttribute(attr, job.string(el.getAttribute(attr), loc + " (alt text)"))
             elif ns == NS_C and ln == "v" and chart_text(el):
-                set_text(el, job.string(get_text(el), loc + " (chart labels)"))
+                set_text(el, job.string(get_text(el), loc + " (chart labels)", label=True))
             elif ns == NS_C and ln == "v" and job.full and get_text(el).strip() and chart_number(el):
                 set_text(el, job.number(get_text(el), loc + " (chart data)"))
             elif ns == NS_P and ln == "text": #legacy comments
                 set_text(el, job.string(get_text(el), loc + " (comment)"))
-            elif ns == NS_S and ln == "t": #excel strings
-                set_text(el, job.string(get_text(el), loc))
+            elif ns == NS_S and ln == "t": #excel strings, masked like chart labels so chart data and chart agree
+                set_text(el, job.string(get_text(el), loc, label=True))
             elif ns == NS_S and ln == "c" and el.getAttribute("t") in ("", "n") and job.full: #every Excel number
                 v = first_child(el, NS_S, "v")
                 if v is not None and get_text(v):
@@ -698,7 +778,7 @@ def read_deck_id(data):
 def custom_props_xml(deck_id):
     return ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n'
             f'<Properties xmlns="{NS_CUSTOM}" xmlns:vt="{NS_VT}">'
-            f'<property fmtid="{FMTID}" pid="2" name="{DECK_ID_PROP}"><vt:lpwstr>{deck_id}</vt:lpwstr></property>'
+            f'<property fmtid="{FMTID}" pid="2" name="{DECK_ID_PROP}"><vt:lpwstr>{escape(deck_id)}</vt:lpwstr></property>'
             '</Properties>').encode("utf-8")
 
 
@@ -811,7 +891,8 @@ def process_package(data, job, parent_loc=None):
     zin = zipfile.ZipFile(io.BytesIO(data))
     names = set(zin.namelist())
     locs = build_locations(zin)
-    stamp = parent_loc is None and job.deck_id
+    #the deck carries its id, an embedded file its name at redaction (PowerPoint renames them on save)
+    stamp = job.deck_id if parent_loc is None else job.deck_id and job.pkg[-1]
 
     def loc_of(name):
         owner = re.sub(r"_rels/(.+)\.rels$", r"\1", name) # a .rels belongs to its part
@@ -827,19 +908,19 @@ def process_package(data, job, parent_loc=None):
             job.ph_pos = placeholder_positions(zin, names, name) if slide else {}
             blob = job.xml(name, blob, loc)
         elif name.lower().endswith(EMBEDDED_OOXML):
-            job.pkg.append(name)
+            job.pkg.append(read_deck_id(blob) or name)
             blob = process_package(blob, job, loc + " (embedded data)")
             job.pkg.pop()
         else:
             blob = job.other(name, blob, loc)
-        done[name] = stamp_deck_id(name, blob, job.deck_id, names) if stamp else blob
+        done[name] = stamp_deck_id(name, blob, stamp, names) if stamp else blob
 
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
         for info in zin.infolist():
             zout.writestr(info, b"" if info.is_dir() else done[info.filename]) #folder entries carry no data
         if stamp and CUSTOM_PROPS not in names:
-            zout.writestr(CUSTOM_PROPS, custom_props_xml(job.deck_id))
+            zout.writestr(CUSTOM_PROPS, custom_props_xml(stamp))
     return out.getvalue()
 
 #restore
@@ -873,7 +954,14 @@ class Restore:
             new[m.start():m.end()] = [""] * (m.end() - m.start())
             masked, before = masked_form(e), text[seg:m.start()]
             if before.lower().endswith(masked.lower()): #anything the designer typed before it is kept
-                new[m.start() - len(masked):m.start()] = list(e["value"])
+                #each original word goes where its lorem word sits, so it takes that word's formatting
+                pos = m.start() - len(masked)
+                for orig, shown in mask_pairs(e):
+                    new[pos:pos + len(shown)] = [orig] + [""] * (len(shown) - 1)
+                    pos += len(shown)
+                if (e.get("style") != "label" #lorem ipsum is about as long, flag outliers
+                        and len(e["value"]) - len(masked) >= max(10, len(masked) * 3 // 10)):
+                    self.layout.add(loc)
             else:
                 #edited: an X value loses the X's just before its marker, an --all text everything since the last marker
                 begin = m.start() - (len(before) - len(before.rstrip("Xx"))) if e["kind"] == "x" else seg
@@ -937,9 +1025,17 @@ def restore_paragraph(p, rj, loc):
             rj.layout.add(loc)
 
 
+def mask_pairs(e):
+    #(original, shown) pieces of a marked entry as it looked in the redacted deck, before its marker
+    if e["kind"] == "x":
+        return [(c, "X") for c in e["value"]]
+    if e.get("style") == "label":
+        return [(e["value"], mask_label(e["value"]))]
+    return mask_tokens(e["value"])
+
+
 def masked_form(e):
-    #what a marked entry looked like in the redacted deck, before its marker
-    return "X" * len(e["value"]) if e["kind"] == "x" else mask_text(e["value"])
+    return "".join(shown for _, shown in mask_pairs(e))
 
 
 def collect_xruns(root, rj, loc):
@@ -1088,7 +1184,7 @@ def restore_xml(name, data, rj, loc):
             if i not in rj.done and f["target"]["part"] == path and restore_field(f, root):
                 rj.done.add(i)
                 rj.dirty = True
-        if path == CUSTOM_PROPS:
+        if name == CUSTOM_PROPS: #the deck's and embedded files' stamps
             for old in deck_id_props(root):
                 root.removeChild(old)
                 rj.dirty = True
@@ -1218,6 +1314,8 @@ def entry_details(e, count):
     d = {"kind": e["kind"]}
     if "mark" in e:
         d["mark"], d["count"] = e["mark"], count
+    if e.get("style") == "label":
+        d["style"] = "label"
     if e.get("numeric"):
         d["numeric"] = True
     if e.get("slots"):
@@ -1281,7 +1379,7 @@ def read_key(path):
         else:
             e = {**item, "kind": kind if kind in ("x", "mask", "placeholder", "link") else "id",
                  "numeric": kind == "number" or bool(target.get("numeric")), "slots": target.get("slots", []),
-                 "count": target.get("count", 0)}
+                 "count": target.get("count", 0), "style": target.get("style", "lorem")}
             if e["kind"] in ("x", "mask"): #--all keys from before the mark field: Text<n>
                 e["mark"] = int(target.get("mark") or e["id"].removeprefix("Text"))
             entries.append(e)
@@ -1409,10 +1507,14 @@ def restore(args):
     if rj.fields:
         left = [f for i, f in enumerate(rj.fields) if i not in rj.done]
         print(f"File properties and comment authors restored: {len(rj.fields) - len(left)} of {len(rj.fields)}")
-        for f in left:
-            print(f"  not restored: {f['id']} {f['type']}")
+        for (label, type_, inner), n in Counter((f["id"], f["type"], "!" in f["target"]["part"]) for f in left).items():
+            print(f"  not restored: {label} {type_}" + (f" in {n} embedded files" if inner else f" x{n}" if n > 1 else ""))
+        if any("!" in f["target"]["part"] for f in left):
+            print("  (embedded files such as chart data were renamed since redaction, "
+                  "decks redacted with this version keep track of them)")
     if rj.layout:
-        print("Check layout, restored text is longer than its ID: " + ", ".join(sorted(rj.layout, key=slide_key)))
+        print("Check layout, restored text is longer than what was on the slide: "
+              + ", ".join(sorted(rj.layout, key=slide_key)))
 
 
 def main():
@@ -1420,7 +1522,7 @@ def main():
     ap.add_argument("pptx")
     ap.add_argument("--preview", action="store_true", help="highlight only, no removal")
     ap.add_argument("--all", action="store_true",
-                    help="mask all text except slide titles (letters -> x/X, digits -> 0), "
+                    help="mask all text except slide titles (words -> lorem ipsum, numbers -> XX, chart labels -> XX/yy), "
                          "chart numbers become placeholders; restorable with the key")
     ap.add_argument("--keywords", help="text file, one term per line; 'term | Label' names it in the key")
     ap.add_argument("--key-dir", help="folder for the restore key (default: next to the deck)")
