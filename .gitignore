@@ -1,0 +1,8 @@
+# decks, test files and everything the scripts produce (redacted/restored decks, reports, restore keys)
+*.pptx
+*.pdf
+*.xlsx
+*.csv
+
+# python cache
+__pycache__/
