@@ -171,10 +171,49 @@ def split_numbers(w):
     return out
 
 
-def mask_tokens(s):
-    #(original, masked) pieces of a text: the words become lorem ipsum in order, again and again, numbers XX
-    #(25, 1,250.5, Q3), the rest stays. restore pairs them back up, so lengths don't have to match
-    out, k, i = [], 0, 0
+def visible(c):
+    #takes up room on the slide (not an accent or a zero-width character)
+    return unicodedata.category(c)[0] not in "MC"
+
+
+def char_width(c):
+    #arabic letters join up and take about 350 (measured in PowerPoint, same in every font tried)
+    return (WIDTH.get(c) or WIDTH.get(unicodedata.normalize("NFD", c)[0])
+            or (350 if unicodedata.bidirectional(c) == "AL" else 556))
+
+
+def text_width(s):
+    return sum(char_width(c) for c in s if visible(c))
+
+
+def case_like(word, orig, first):
+    cased = [c for c in orig if c.lower() != c.upper()]
+    if len(cased) > 1 and all(c.isupper() for c in cased):
+        return word.upper()
+    if cased and cased[0].isupper() or not cased and first: #scripts without capitals: first word only
+        return word.capitalize()
+    return word
+
+
+def fit_word(orig, first, turn):
+    #a lorem ipsum word with as many letters as orig and no wider, so every line breaks where it did;
+    #a shorter one when none of that length fits (narrow letters). turn cycles through each length so words don't repeat
+    room, n = text_width(orig), min(sum(map(visible, orig)), max(FIT_WORDS))
+    for size in range(n, 0, -1):
+        words, start = FIT_WORDS[size], turn.get(size, 0)
+        for j in range(len(words)):
+            w = case_like(words[(start + j) % len(words)], orig, first)
+            if text_width(w) <= room:
+                turn[size] = start + j + 1
+                return w
+    return case_like(min(FIT_WORDS[1], key=text_width), orig, first)
+
+
+def mask_tokens(s, fit=True):
+    #(original, masked) pieces of a text: each word becomes a lorem ipsum word that fits in its place, numbers XX
+    #(25, 1,250.5, Q3) or X for a single digit (numbered circles), the rest stays.
+    #fit=False: keys made before, the words in order and every number XX. restore pairs them back up
+    out, k, i, turn = [], 0, 0, {}
     while i < len(s):
         j = i
         while j < len(s) and in_word(s, j, i):
@@ -185,14 +224,9 @@ def mask_tokens(s):
             continue
         for orig in split_numbers(s[i:j]):
             if has_number(orig):
-                out.append((orig, "XX"))
+                out.append((orig, "X" if fit and len(orig) == 1 else "XX"))
                 continue
-            word = LOREM[k % len(LOREM)]
-            cased = [c for c in orig if c.lower() != c.upper()]
-            if len(cased) > 1 and all(c.isupper() for c in cased):
-                word = word.upper()
-            elif cased and cased[0].isupper() or not cased and k == 0: #scripts without capitals: first word only
-                word = word.capitalize()
+            word = fit_word(orig, k == 0, turn) if fit else case_like(LOREM[k % len(LOREM)], orig, k == 0)
             out.append((orig, word))
             k += 1
         i = j
@@ -243,7 +277,8 @@ FMTID = "{D5CDD505-2E9C-101B-9397-08002B2CF9AE}"
 LAYOUT_GROWTH = 5 #restored text this many characters longer than what was on the slide is flagged for a layout check
 
 #detected values become capital X's, one per character (+971 50 123 4567 -> 16 X's).
-#--all mode: the words become lorem ipsum in order (arabic too), numbers XX, chart labels XX or yy; restore pairs each word back with its original.
+#--all mode: each word becomes a lorem ipsum word with as many letters and no wider (arabic too), so the text keeps its line breaks
+#and the designer has no reason to retype it; numbers XX, chart labels XX or yy. restore pairs each word back with its original.
 #each masked value or text ends with an invisible marker (zero-width characters) holding its restore id: 16-bit id + 4-bit check
 TITLE_PH = {"title", "ctrTitle"} #slide titles stay readable
 CORE_TEXT = {"title", "subject", "keywords", "description", "category", "contentStatus"}
@@ -253,6 +288,23 @@ LOREM = ("lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod 
          "magna aliqua ut enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo "
          "consequat duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur "
          "excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserunt mollit anim id est laborum").split()
+#lorem ipsum words by number of letters, to pick one that fits in place of each word
+FIT_WORDS = {}
+for w in dict.fromkeys(LOREM + (
+        "a e at ne si se nam quo eos per rem aut vel nec cum nibh nunc quam odio eget erat ante arcu diam orci urna "
+        "porta justo lacus massa morbi purus risus felis fusce vitae sequi natus error beatae dictum auctor libero "
+        "mattis mauris nullam ornare turpis varius semper sapien tellus tempus integer dapibus egestas euismod feugiat "
+        "iaculis posuere pretium rhoncus sodales vivamus viverra aliquam habitant maecenas molestie placerat pulvinar "
+        "sagittis suscipit vehicula volutpat eleifend lobortis interdum tristique fermentum elementum malesuada "
+        "penatibus phasellus tincidunt vulputate venenatis convallis curabitur imperdiet ultricies laboriosam "
+        "doloremque architecto voluptatem aspernatur vestibulum parturient consequatur scelerisque ullamcorper "
+        "condimentum accusantium dignissimos repellendus pellentesque sollicitudin perspiciatis voluptatibus "
+        "exercitationem necessitatibus").split()):
+    FIT_WORDS.setdefault(len(w), []).append(w)
+#approximate letter widths (Arial, 1/1000 em; anything else 556), to keep each masked word no wider than its original
+WIDTH = {c: w for w, cs in ((191, "'"), (222, "ijl‘’"), (278, "ft .,:;/!I\\"), (333, "r-()[]"), (500, "cksvxyzJ?"),
+                            (584, "+=<>~"), (611, "FTZ"), (667, "ABEKPSVXY&"), (722, "wCDHNRU"), (778, "GOQ"),
+                            (833, "mM"), (889, "%"), (944, "W")) for c in cs}
 #web links can't hold an invisible marker so they point to a placeholder on the reserved .invalid domain
 LINK_HOST = "https://masked.invalid/"
 LINK_RX = re.compile(r"https?://masked\.invalid/(Link\d+)/?", re.I)
@@ -272,6 +324,7 @@ NOTE_TEXT = {
     "EMBEDDED_OBJECT_NOT_SCANNED": "Embedded object that could not be scanned: check it by hand",
     "THUMBNAIL_BLANKED": "File preview image blanked (not restored, it would show the pre-edit first slide)",
     "COMMENT_AUTHOR_CLEARED": "Comment author cleared (original kept in the Restore key sheet)",
+    "MASKED_TEXT_WIDER": "Masked text is wider than the original (many short numbers became XX): check it still fits before sending",
 }
 
 BLANK_JPEG = base64.b64decode(
@@ -387,7 +440,7 @@ class Job:
         self.place(tid, loc)
         return tid, "X" * len(value) + marker(entry["mark"])
 
-    def mark(self, text, loc, style="lorem"):
+    def mark(self, text, loc, style="fit"):
         #--all: invisible marker for a masked text, same text same marker
         tid = self.marks.get((style, text))
         if tid is None:
@@ -401,7 +454,7 @@ class Job:
     def mask_string(self, s, loc, label=False):
         if not any(ch.isalnum() for ch in s):
             return s
-        return (mask_label(s) if label else mask_text(s)) + self.mark(s, loc, "label" if label else "lorem")
+        return (mask_label(s) if label else mask_text(s)) + self.mark(s, loc, "label" if label else "fit")
 
     def string(self, s, loc, label=False):
         #text outside paragraphs: fully masked in --all mode (chart labels XX/yy), pattern redaction otherwise
@@ -650,6 +703,8 @@ def mask_paragraph(p, job, loc):
         pos += len(orig)
     for t, s in zip(ts, out):
         set_text(t, s)
+    if text_width("".join(out)) > text_width(text) * 1.05 + 1000: #words fit, many short numbers (12 -> XX) may not
+        job.log(loc, "MASKED_TEXT_WIDER")
     set_text(ts[-1], get_text(ts[-1]) + job.mark(text, loc))
     return True
 
@@ -1031,7 +1086,7 @@ def mask_pairs(e):
         return [(c, "X") for c in e["value"]]
     if e.get("style") == "label":
         return [(e["value"], mask_label(e["value"]))]
-    return mask_tokens(e["value"])
+    return mask_tokens(e["value"], fit=e.get("style") != "lorem")
 
 
 def masked_form(e):
@@ -1314,8 +1369,8 @@ def entry_details(e, count):
     d = {"kind": e["kind"]}
     if "mark" in e:
         d["mark"], d["count"] = e["mark"], count
-    if e.get("style") == "label":
-        d["style"] = "label"
+    if e.get("style"):
+        d["style"] = e["style"]
     if e.get("numeric"):
         d["numeric"] = True
     if e.get("slots"):
@@ -1379,7 +1434,7 @@ def read_key(path):
         else:
             e = {**item, "kind": kind if kind in ("x", "mask", "placeholder", "link") else "id",
                  "numeric": kind == "number" or bool(target.get("numeric")), "slots": target.get("slots", []),
-                 "count": target.get("count", 0), "style": target.get("style", "lorem")}
+                 "count": target.get("count", 0), "style": target.get("style", "lorem")} #keys from before fit: lorem in order
             if e["kind"] in ("x", "mask"): #--all keys from before the mark field: Text<n>
                 e["mark"] = int(target.get("mark") or e["id"].removeprefix("Text"))
             entries.append(e)

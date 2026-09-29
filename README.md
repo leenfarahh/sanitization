@@ -29,7 +29,7 @@ In the key, set **Restore (Y/N)** to N for anything that should stay masked. The
 
 **Default mode:** detected values become X's, one per character. It detects emails, UAE/KSA/Jordan/Qatar phone numbers and IBANs, payment cards, Emirates ID, Saudi ID/Iqama, Qatar QID, Jordan national number, passport numbers, and your keywords. Everything else stays readable.
 
-**--all** mode:** all text except slide titles becomes lorem ipsum, numbers in text become XX, chart labels become XX (yy for years), and chart and Excel numbers become random placeholders. Web links point to a placeholder address.
+**--all mode:** all text except slide titles becomes lorem ipsum, numbers in text become XX (X for a single digit), chart labels become XX (yy for years), and chart and Excel numbers become random placeholders. Web links point to a placeholder address. Each word is replaced by a lorem ipsum word with the same number of letters that is no wider
 
 **Both modes** cover slides, notes, layouts, master, comments, alt text, SmartArt, charts and embedded Excel data. They also clear author, last modified by, company and manager from file properties, replace comment authors, and blank the file preview image.
 
@@ -57,7 +57,9 @@ In the key, set **Restore (Y/N)** to N for anything that should stay masked. The
 ### **--all** mode
 
 - Slide titles stay readable; only detected values and keywords in them are masked. A title typed in a regular text box is masked like body text.
-- The shape of the text survives: word count, capitalization (AED becomes LOREM), punctuation, % and currency symbols.
+- The shape of the text survives: word count, word lengths, capitalization (AED stays three capital letters), punctuation, % and currency symbols.
+- Fit is estimated from Arial letter widths. In wide fonts such as Georgia a one-line label can come out a few points wider; in testing across four fonts, no text box gained a line or overflowed. Paragraphs with many two-digit numbers (12 becomes the slightly wider XX) are listed in **Review notes**.
+- Arabic becomes Latin lorem ipsum with fewer letters, since Arabic letters join up and take less room.
 - Chart placeholders (101 to 999) ignore fixed axis limits and number formats.
 ### Restore
 
