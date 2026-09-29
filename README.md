@@ -1,4 +1,4 @@
-# sanitize_pptx
+# sanitize_pptx.py
 
 Masks confidential content in a PowerPoint deck so it can be sent out for formatting, then puts the originals back when the deck returns.
 
@@ -23,15 +23,15 @@ Works on **.pptx** only: save **.ppt** files as **.pptx** first
 - **--key-dir folder** saves the key somewhere else.
 - **--force** restores even when the key was made for a different deck.
 
-In the key, set **Restore (Y/N)** to N for anything that should stay masked. The **Review notes** sheet lists what needs a manual check.
+In the key workbook, **Restore key** sheet set **Restore(Y/N)** field to N for anything that should stay masked. The **Review notes** sheet lists what needs a manual check.
 
 ## What gets masked
 
-**Default mode:** detected values become X's, one per character. It detects emails, UAE/KSA/Jordan/Qatar phone numbers and IBANs, payment cards, Emirates ID, Saudi ID/Iqama, Qatar QID, Jordan national number, passport numbers, and your keywords. Everything else stays readable.
+**Default mode:** each detected value becomes a single **[X]**, whatever its length, so a slide or table full of values stays readable (**+971 50 123 4567** becomes **[X]**). It detects emails, UAE/KSA/Jordan/Qatar phone numbers and IBANs, payment cards, Emirates ID, Saudi ID/Iqama, Qatar QID, Jordan national number, passport numbers, and your keywords. Everything else stays readable.
 
-**--all mode:** all text except slide titles becomes lorem ipsum, numbers in text become XX (X for a single digit), chart labels become XX (yy for years), and chart and Excel numbers become random placeholders. Web links point to a placeholder address. Each word is replaced by a lorem ipsum word with the same number of letters that is no wider
+**--all mode:** all text except slide titles becomes **[X]**: one per paragraph, plus one for each line break and each formatting change, so a bold lead-in keeps its bold on restore (**Note:** driven by retail becomes **[X]** [X]). Chart labels become **[X]**, and chart and Excel numbers become random placeholders. Web links point to a placeholder address.
 
-**Both modes** cover slides, notes, layouts, master, comments, alt text, SmartArt, charts and embedded Excel data. They also clear author, last modified by, company and manager from file properties, replace comment authors, and blank the file preview image.
+**Both modes** cover slides, notes, layouts, master, comments, alt text, SmartArt, charts and embedded Excel data. They also set author, last modified by, company and manager in file properties and comment author names to **[X]**, and blank the file preview image. **[X]** is the only mask used anywhere; the two exceptions are chart and Excel numbers in **--all** (charts need numbers to draw) and link addresses (they must stay valid web addresses).
 
 ## Limitations
 
@@ -57,14 +57,14 @@ In the key, set **Restore (Y/N)** to N for anything that should stay masked. The
 ### **--all** mode
 
 - Slide titles stay readable; only detected values and keywords in them are masked. A title typed in a regular text box is masked like body text.
-- The shape of the text survives: word count, word lengths, capitalization (AED stays three capital letters), punctuation, % and currency symbols.
-- Fit is estimated from Arial letter widths. In wide fonts such as Georgia a one-line label can come out a few points wider; in testing across four fonts, no text box gained a line or overflowed. Paragraphs with many two-digit numbers (12 becomes the slightly wider XX) are listed in **Review notes**.
-- Arabic becomes Latin lorem ipsum with fewer letters, since Arabic letters join up and take less room.
+- Only the structure survives: paragraphs, line breaks and where the formatting changes. Designers cannot see how long each text is, so restored slides need a layout check (restore lists them).
+- **[X]** is wider than a single digit. In small shapes such as numbered circles it wraps onto several lines.
+- Runs that differ only in spelling language are shown as one **[X]** and come back as one run, in the first run's language.
 - Chart placeholders (101 to 999) ignore fixed axis limits and number formats.
 ### Restore
 
-- Each masked text ends in an invisible marker. Retyping the text, or deleting its last character, breaks the marker. That value is then reported as not found and has to be restored by hand from the key. For default-mode X's, restore suggests likely matches by length and position for someone to confirm.
-- If a masked text is split across several text boxes, the full original goes back into the box holding the marker and the others keep the lorem ipsum. The slide is listed as edited.
+- Each masked text ends in an invisible marker. Retyping the text, or deleting its last character, breaks the marker. That value is then reported as not found and has to be restored by hand from the key. For default-mode **[X]**s, restore suggests likely matches by position for someone to confirm. Decks masked by an older version of this tool still restore with their keys, but each masked text comes back whole in one formatting, and the slides are listed to check formatting. Their comment authors have to be restored by hand from the key.
+- If a masked text is split across several text boxes, the full original goes back into the box holding the marker and the others keep their **[X]**. The slide is listed as edited.
 - Chart numbers restore by their placeholder values. A chart with retyped data cannot be restored, and a new value that happens to equal a placeholder gets swapped.
-- Restored text can be longer than what the designer laid out. Affected slides are listed for a layout check.
+- Restored text can be longer than what the designer laid out. Affected slides are listed for a layout check. This is most slides with masked text, since **[X]** is shorter than almost anything it hides.
 - If the slides are moved into a new file, the key cannot be matched to the deck automatically. Restore still works, with a warning.
