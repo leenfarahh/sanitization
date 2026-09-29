@@ -1,7 +1,7 @@
 
 #python sanitize_pptx.py deck.pptx --preview (yellow highlights + CSV report)
 #python sanitize_pptx.py deck.pptx (each confidential value becomes [X] + restore key .xlsx that stays with the client)
-#python sanitize_pptx.py deck.pptx --keywords names.txt
+#python sanitize_pptx.py deck.pptx --keywords keywords.txt (only the terms in keywords.txt become [X], emails/phones/IDs/IBANs/cards are left as they are)
 #python sanitize_pptx.py deck.pptx --all (all text except slide titles becomes [X], one per paragraph, line and formatting change; chart labels [X]; restorable with the key)
 #python sanitize_pptx.py returned_deck.pptx --restore deck_restore_key.xlsx (put the original values back)
 
@@ -99,13 +99,13 @@ ID_PREFIX = {
 DIGIT_MAP = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
 
 #detection
-def find_matches(text: str, keywords=None):
+def find_matches(text: str, keywords=None, rules=COMPILED):
     #return list of (start, end, rule_name), first/longest wins when there's overlap
     norm = text.translate(DIGIT_MAP)
     lower = norm.lower()
     hits = []
 
-    for name, rx, validator, context in COMPILED:
+    for name, rx, validator, context in rules:
         for m in rx.finditer(norm):
             if validator and not validator(m.group()):
                 continue
@@ -288,6 +288,7 @@ def part_path(pkg, name):
 class Job:
     def __init__(self, keywords, labels, preview, full=False):
         self.keywords, self.labels, self.preview, self.full = keywords, labels, preview, full
+        self.rules = [] if keywords else COMPILED #a keyword list replaces the built-in rules: only its terms are redacted
         self.rows = []
         self.ids, self.entries, self.fields = {}, {}, []
         self.marks, self.numbers, self.links = {}, {}, {} 
@@ -381,7 +382,7 @@ class Job:
         #plain-string redaction (attributes, chart caches, cells).
         if not s:
             return s
-        matches = find_matches(s, self.keywords)
+        matches = find_matches(s, self.keywords, self.rules)
         for start, end, rule in matches:
             self.log(loc, rule, s[start:end])
         if self.preview:
@@ -462,7 +463,7 @@ def add_highlight(run):
 
 def process_paragraph(p, job, loc):
     text = "".join(s[3] for s in segments(p))
-    matches = find_matches(text, job.keywords)
+    matches = find_matches(text, job.keywords, job.rules)
     for start, end, rule in matches:
         job.log(loc, rule, text[start:end])
     #markers are assigned left to right, then spliced right to left so offsets stay valid
@@ -625,7 +626,7 @@ def process_xml(name, data, job, loc):
                 continue
             here = loc + " (hyperlink)"
             if t.lower().startswith(("mailto:", "tel:")): #a link address can't hold a marker, so it gets a placeholder
-                matches = find_matches(t, job.keywords)
+                matches = find_matches(t, job.keywords, job.rules)
                 for start, end, rule in matches:
                     job.log(here, rule, t[start:end])
                 if job.full or matches and not job.preview:
@@ -1316,7 +1317,8 @@ def write_key(path, job, src):
              ["Redacted on", datetime.now().strftime("%d/%m/%Y %H:%M")],
              ["Deck ID", job.deck_id],
              ["Mode", "All text except slide titles replaced with [X] (--all)" if job.full
-                      else "Confidential details replaced with [X], one per value"],
+                      else "Only the terms in the keyword list replaced with [X], one per value (--keywords)"
+                      if not job.rules else "Confidential details replaced with [X], one per value"],
              ["Items", "Each [X] on a slide is numbered top to bottom (item 1 is highest). If a value's invisible marker "
                        "is lost, restore suggests unmarked [X]s in the same position, to check by hand."],
              ["Keep this file", "It holds the original values. Keep it on this machine and never send it with the deck."],
@@ -1373,6 +1375,8 @@ def load_keywords(path):
 
 def redact(args):
     keywords, labels = load_keywords(args.keywords) if args.keywords else ([], {})
+    if args.keywords and not keywords: #an empty list would redact nothing at all
+        raise SystemExit(f"{args.keywords} has no terms. Add one term per line, the deck was not redacted.")
     src = Path(args.pptx)
     job = Job(keywords, labels, args.preview, args.all)
     result = process_package(src.read_bytes(), job)
@@ -1495,7 +1499,8 @@ def main():
     ap.add_argument("--all", action="store_true",
                     help="mask all text except slide titles (each paragraph, line and formatting change -> [X], chart labels -> [X]), "
                          "chart numbers become placeholders; restorable with the key")
-    ap.add_argument("--keywords", help="text file, one term per line; 'term | Label' names it in the key")
+    ap.add_argument("--keywords", help="text file, one term per line: only these terms are redacted, the built-in "
+                                       "email/phone/ID/IBAN/card rules are off; 'term | Label' names it in the key")
     ap.add_argument("--key-dir", help="folder for the restore key (default: next to the deck)")
     ap.add_argument("--restore", metavar="KEY", help="put the original values back using this restore key (.xlsx)")
     ap.add_argument("--force", action="store_true", help="restore even if the key was made for a different deck")
