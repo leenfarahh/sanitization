@@ -44,10 +44,12 @@ Before masking, it says how many matches it found and on which slides; **Preview
 ### Setup on a computer
 
 1. Install Python 3.9 or later from **python.org** (tested with 3.12). In the installer, tick **Add Python to PATH** and keep **tcl/tk and IDLE** ticked. Use the python.org installer: Smart App Control can block other Python builds.
-2. Copy this folder to the computer, or clone the repository. The app needs **sanitize_pptx.py**, **sanitize_desktop.py** and **Setup Sanitize.bat**.
+2. Copy this folder to the computer, or clone the repository. The app needs **sanitize_pptx.py**, **sanitize_desktop.py**, **Setup Sanitize.bat** and **sanitize.ico**.
 3. Double-click **Setup Sanitize.bat**. It checks Python and puts a **Sanitize** shortcut on the desktop.
 
 There are no packages to install. Run the setup again after moving the folder or reinstalling Python: the shortcut points to both.
+
+The icon, in light and dark mode alike, is **sanitize.ico**: the app's card with the Prezlab **pl:** logomark, in the brand colors. Its source is **sanitize.svg**. After changing the SVG, run **python build_icon.py** to rebuild the .ico (Microsoft Edge renders each size), then run the setup again so the shortcut shows it.
 
 ## Browser view
 

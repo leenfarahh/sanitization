@@ -13,9 +13,6 @@ sanitizer.cs
 # Pyodide bridge for an Office.js add-in, kept in its own repository
 web/
 
-# desktop shortcut icon, written by Setup Sanitize.bat on each computer
-sanitize.ico
-
 # python cache
 __pycache__/
 

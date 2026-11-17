@@ -13,20 +13,19 @@ import base64
 import ctypes
 import os
 import re
-import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-import zlib
 from pathlib import Path
-from tkinter import Button, Frame, Label, PhotoImage, Text, Tk, Toplevel, filedialog, font, messagebox, ttk
+from tkinter import Button, Frame, Label, Text, Tk, Toplevel, filedialog, font, messagebox, ttk
 
 import sanitize_pptx as sp
 
 APP_NAME = "Sanitize"
 HERE = Path(__file__).resolve().parent
+ICON = HERE / "sanitize.ico"  # window, taskbar and shortcut icon, built from sanitize.svg by build_icon.py
 PREVIEW_DIR = Path(tempfile.gettempdir()) / "Sanitize previews"
 RESTORE_HINT = "Open Sanitize from the desktop, choose Restore, then pick the returned deck and this key."
 FRIENDLY = {"wrong_key": "This key was made for a different deck. Pick the key saved when this deck was masked."}
@@ -57,6 +56,28 @@ def downloads_dir() -> Path:
     except (ImportError, OSError):
         pass
     return Path.home() / "Downloads"
+
+
+try:  # own handle with 64-bit safe signatures, for the window icons
+    _user32 = ctypes.WinDLL("user32")
+    _user32.LoadImageW.restype = ctypes.c_void_p
+    _user32.LoadImageW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_uint]
+    _user32.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_void_p]
+except AttributeError:  # not Windows
+    _user32 = None
+
+
+def window_icons() -> dict[int, int]:
+    """Icon handles from sanitize.ico at the sizes Windows asks for: small for title bars, big for the taskbar and
+    Alt+Tab. Empty when the file or the Windows calls aren't available: the windows then keep Tk's icon."""
+    if _user32 is None or not ICON.exists():
+        return {}
+    icons = {}
+    for which, metric in ((0, 49), (1, 11)):  # ICON_SMALL: SM_CXSMICON, ICON_BIG: SM_CXICON
+        size = _user32.GetSystemMetrics(metric)
+        icons[which] = _user32.LoadImageW(None, str(ICON), 1, size, size, 0x10)  # IMAGE_ICON, LR_LOADFROMFILE
+    return icons if all(icons.values()) else {}
 
 
 def slides_in(locations) -> list[int]:
@@ -195,55 +216,6 @@ def run_app(ui, out_dir: Path) -> int:
             ui.error(f"Something went wrong.\n\n{exc}")
 
 
-# icon: [X] in Light Teal on Dark Teal, drawn here so the folder needs no image files
-_MARK = (  # line segments in a 1 x 1 square: both brackets and the two strokes of the X
-    ((0.24, 0.25), (0.24, 0.75)), ((0.24, 0.25), (0.34, 0.25)), ((0.24, 0.75), (0.34, 0.75)),
-    ((0.76, 0.25), (0.76, 0.75)), ((0.76, 0.25), (0.66, 0.25)), ((0.76, 0.75), (0.66, 0.75)),
-    ((0.42, 0.37), (0.58, 0.63)), ((0.42, 0.63), (0.58, 0.37)),
-)
-_STROKE = 0.045  # half the line width
-
-
-def _on_mark(u: float, v: float) -> bool:
-    if not (0.19 < u < 0.81 and 0.2 < v < 0.8):
-        return False
-    for (ax, ay), (bx, by) in _MARK:
-        dx, dy = bx - ax, by - ay
-        t = max(0.0, min(1.0, ((u - ax) * dx + (v - ay) * dy) / (dx * dx + dy * dy)))
-        if (ax + t * dx - u) ** 2 + (ay + t * dy - v) ** 2 <= _STROKE ** 2:
-            return True
-    return False
-
-
-def icon_png(size: int, samples: int) -> bytes:
-    """The icon as PNG bytes; samples x samples points per pixel smooth the edges."""
-    dark, light = bytes.fromhex(DARK_TEAL[1:]), bytes.fromhex(LIGHT_TEAL[1:])
-    steps = [(i + 0.5) / samples for i in range(samples)]
-    raw = bytearray()
-    for y in range(size):
-        raw.append(0)  # PNG row filter: none
-        for x in range(size):
-            cover = sum(_on_mark((x + dx) / size, (y + dy) / size) for dx in steps for dy in steps) / samples ** 2
-            raw += bytes(round(d + (l - d) * cover) for d, l in zip(dark, light)) + b"\xff"
-
-    def chunk(tag: bytes, body: bytes) -> bytes:
-        return struct.pack(">I", len(body)) + tag + body + struct.pack(">I", zlib.crc32(tag + body))
-
-    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0))
-            + chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b""))
-
-
-def icon_ico(sizes: tuple[int, ...] = (16, 32, 48, 256)) -> bytes:
-    """The icon as an .ico file for the desktop shortcut."""
-    pngs = [icon_png(s, 4 if s <= 64 else 2) for s in sizes]
-    offset = 6 + 16 * len(pngs)
-    entries = b""
-    for s, png in zip(sizes, pngs):
-        entries += struct.pack("<BBBBHHII", s % 256, s % 256, 0, 0, 1, 32, len(png), offset)  # 0 means 256
-        offset += len(png)
-    return struct.pack("<HHH", 0, 1, len(pngs)) + entries + b"".join(pngs)
-
-
 def _brand_fonts(families: set[str]) -> dict[str, tuple]:
     """Figtree, the brand's functional typeface, with Segoe UI where it isn't installed."""
 
@@ -273,8 +245,7 @@ class TkUI:
         self._root.attributes("-topmost", True)  # open dialogs in front of other windows
         self._root.report_callback_exception = lambda _type, exc, _tb: self.error(f"Something went wrong.\n\n{exc}")
         self._fonts = _brand_fonts(set(font.families(self._root)))
-        self._icon = PhotoImage(data=base64.b64encode(icon_png(64, 4)).decode())
-        self._root.iconphoto(True, self._icon)
+        self._icons = window_icons()  # set on each window as it opens
         style = ttk.Style(self._root)
         style.theme_use("clam")  # the only ttk widget is the progress bar; clam lets it take the brand colors
         style.configure("Busy.Horizontal.TProgressbar", troughcolor=OFF_WHITE, background=DARK_TEAL,
@@ -309,6 +280,9 @@ class TkUI:
     def _show(self, window: Toplevel) -> None:
         """Center the window, bring it to the front without pinning it there, and wait until it closes."""
         self._root.eval(f"tk::PlaceWindow {window} center")
+        window.update_idletasks()
+        for which, icon in self._icons.items():
+            _user32.SendMessageW(int(window.wm_frame(), 16), 0x0080, which, icon)  # WM_SETICON
         window.grab_set()
         window.attributes("-topmost", True)
         window.after_idle(window.attributes, "-topmost", False)
@@ -481,7 +455,7 @@ $s = (New-Object -ComObject WScript.Shell).CreateShortcut($path)
 $s.TargetPath = $env:SAN_PYTHONW
 $s.Arguments = '"' + $env:SAN_SCRIPT + '"'
 $s.WorkingDirectory = $env:SAN_DIR
-$s.IconLocation = $env:SAN_ICON + ',0'
+if ($env:SAN_ICON) { $s.IconLocation = $env:SAN_ICON + ',0' }
 $s.Description = 'Mask a deck before it goes out, restore it when it comes back'
 $s.Save()
 $path
@@ -489,21 +463,22 @@ $path
 
 
 def setup() -> int:
-    """Write the icon next to this file and put a Sanitize shortcut on this user's desktop."""
+    """Put a Sanitize shortcut, with sanitize.ico as its icon, on this user's desktop."""
     pythonw = Path(sys.executable).with_name("pythonw.exe")
     if not pythonw.exists():
         print(f"pythonw.exe was not found next to {sys.executable}. Install Python from python.org, then run the setup again.")
         return 1
-    icon = HERE / "sanitize.ico"
-    icon.write_bytes(icon_ico())
+    if not ICON.exists():
+        print(f"{ICON.name} is missing, so the shortcut gets Python's icon.")
     env = {**os.environ, "SAN_PYTHONW": str(pythonw), "SAN_SCRIPT": str(Path(__file__).resolve()),
-           "SAN_DIR": str(HERE), "SAN_ICON": str(icon)}
+           "SAN_DIR": str(HERE), "SAN_ICON": str(ICON) if ICON.exists() else ""}
     script = base64.b64encode(PS_SHORTCUT.encode("utf-16-le")).decode()
     done = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", script],
                           env=env, capture_output=True, text=True)
     if done.returncode:
         print("Could not create the desktop shortcut.\n" + done.stderr.strip())
         return 1
+    ctypes.windll.shell32.SHChangeNotify(0x08000000, 0, None, None)  # refresh icons, in case an older one is cached
     print(f"Shortcut created: {done.stdout.strip()}")
     return 0
 
