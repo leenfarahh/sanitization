@@ -4,5 +4,20 @@
 *.xlsx
 *.csv
 
+# videos (walkthroughs and recordings are shared outside the repo)
+*.mp4
+
+# C# port for the PowerPoint add-in, kept with the add-in's code
+sanitizer.cs
+
+# Pyodide bridge for an Office.js add-in, kept in its own repository
+web/
+
+# desktop shortcut icon, written by Setup Sanitize.bat on each computer
+sanitize.ico
+
 # python cache
 __pycache__/
+
+# visual studio
+.vs/

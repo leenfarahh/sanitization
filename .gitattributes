@@ -1,0 +1,3 @@
+* text=auto
+# cmd needs Windows line endings, whatever the git settings of the computer that clones the repo
+*.bat text eol=crlf

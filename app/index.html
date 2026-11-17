@@ -1,0 +1,449 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sanitize</title>
+<style>
+  :root {
+    --purple: #5300ff;
+    --purple-hover: #4300d0;
+    --purple-soft: #dcc3ff;
+    --lavender: #f2edff;
+    --ink: #1b1820;
+    --muted: #5f5b66;
+    --faint: #8a8691;
+    --line: #e4e2ea;
+    --surface: #ffffff;
+    --page: #f7f6fa;
+    --pill: #1e0d33;
+    --yellow: #fff200;
+    --danger: #b3261e;
+    --danger-soft: #fdecea;
+    --shadow: 0 14px 36px rgba(30, 13, 51, 0.10), 0 2px 6px rgba(30, 13, 51, 0.06);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--page); color: var(--ink);
+    font: 14px/1.45 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  }
+  button, input, textarea { font: inherit; color: inherit; }
+  [hidden] { display: none !important; }
+
+  /* header and ribbon */
+  header {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 14px 24px; background: var(--surface); border-bottom: 1px solid var(--line);
+  }
+  .pill {
+    background: var(--pill); color: #fff; font-weight: 700; font-size: 13px;
+    padding: 5px 14px; border-radius: 999px; letter-spacing: 0.01em;
+  }
+  .caption { color: var(--muted); flex: 1 1 320px; }
+  .deck { display: flex; align-items: center; gap: 10px; color: var(--muted); }
+  .deck strong { color: var(--ink); font-weight: 600; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .ribbon {
+    display: flex; align-items: stretch; gap: 4px; padding: 8px 24px;
+    background: #fafafa; border-bottom: 1px solid var(--line);
+  }
+  .tool {
+    display: flex; flex-direction: column; align-items: center; gap: 4px; min-width: 96px;
+    padding: 8px 10px 6px; border: 1px solid transparent; border-radius: 6px; background: none; cursor: pointer;
+  }
+  .tool:hover:not(:disabled) { background: #ececf0; }
+  .tool[aria-pressed="true"] { background: var(--lavender); border-color: var(--purple); }
+  .tool:disabled { opacity: 0.4; cursor: default; }
+  .tool svg { width: 32px; height: 32px; }
+  .tool span { font-size: 13px; }
+  .ribbon .sep { width: 1px; background: var(--line); margin: 6px 6px; }
+  .ribbon .offline { margin-left: auto; align-self: center; color: var(--faint); font-size: 12px; }
+
+  /* layout */
+  main {
+    display: grid; grid-template-columns: minmax(320px, 440px) 1fr; gap: 32px; align-items: start;
+    padding: 32px 24px; max-width: 1360px; margin: 0 auto;
+  }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+
+  /* dialog card */
+  .card {
+    position: relative; background: var(--surface); border: 1px solid var(--line); border-radius: 12px;
+    box-shadow: var(--shadow); display: flex; flex-direction: column; min-height: 360px;
+  }
+  .card .body { padding: 26px 26px 20px; flex: 1; }
+  .card h2 { margin: 0 0 6px; font-size: 21px; font-weight: 700; }
+  .card h3 { margin: 18px 0 8px; font-size: 14px; font-weight: 600; }
+  .sub { margin: 0 0 16px; color: var(--muted); }
+  .hint { margin: 8px 0 0; color: var(--faint); font-size: 12.5px; }
+  .card footer {
+    display: flex; align-items: center; gap: 10px; padding: 14px 20px 14px 26px; border-top: 1px solid var(--line);
+  }
+  .card footer .offline { color: var(--faint); font-size: 12.5px; margin-right: auto; }
+  textarea {
+    width: 100%; min-height: 150px; resize: vertical; padding: 10px 12px;
+    border: 1px solid var(--line); border-radius: 8px; outline: none; background: #fff;
+  }
+  textarea:focus, input:focus { border-color: var(--purple); box-shadow: 0 0 0 3px rgba(83, 0, 255, 0.12); }
+  label.field { display: block; font-weight: 600; margin: 8px 0 8px; }
+  .row { display: flex; gap: 10px; }
+  .row input { flex: 1; min-width: 0; padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    padding: 7px 18px; min-height: 34px; border-radius: 6px; cursor: pointer;
+    border: 1px solid var(--line); background: #fff; font-weight: 500;
+  }
+  .btn:hover:not(:disabled) { background: #f3f2f6; }
+  .btn.primary { background: var(--purple); border-color: var(--purple); color: #fff; }
+  .btn.primary:hover:not(:disabled) { background: var(--purple-hover); }
+  .btn:disabled { opacity: 0.45; cursor: default; }
+  .btn:focus-visible, .tool:focus-visible, .choice:focus-visible, .check-item:focus-visible { outline: 2px solid var(--purple); outline-offset: 2px; }
+
+  .choices { display: grid; gap: 10px; }
+  .choice {
+    display: flex; gap: 12px; align-items: center; text-align: left; padding: 12px 14px;
+    border: 1px solid var(--line); border-radius: 8px; background: #fff; cursor: pointer;
+  }
+  .choice:hover { border-color: var(--purple); background: var(--lavender); }
+  .choice svg { width: 28px; height: 28px; flex: none; }
+  .choice b { display: block; }
+  .choice small { color: var(--muted); font-size: 12.5px; }
+
+  /* confirmation over the card, as in the walkthrough */
+  .confirm {
+    position: absolute; left: 26px; right: 26px; top: 64px; background: #fff; border: 1px solid var(--line);
+    border-radius: 10px; box-shadow: var(--shadow); z-index: 2;
+  }
+  .confirm .body { padding: 20px 22px 16px; }
+  .confirm h2 { font-size: 18px; }
+  .confirm footer { padding: 12px 14px 12px 22px; }
+
+  .busy { display: grid; place-items: center; align-content: center; gap: 14px; min-height: 230px; font-weight: 600; }
+  .spinner { width: 34px; height: 34px; position: relative; }
+  .spinner i {
+    position: absolute; width: 7px; height: 7px; border-radius: 50%; background: var(--purple);
+    left: 13.5px; top: 0; transform-origin: 3.5px 17px; animation: fade 1s linear infinite;
+  }
+  @keyframes fade { from { opacity: 1; } to { opacity: 0.15; } }
+  @media (prefers-reduced-motion: reduce) { .spinner i { animation: none; } }
+
+  .done-title { display: flex; align-items: center; gap: 10px; }
+  .done-title svg { width: 30px; height: 30px; flex: none; }
+  .check-list { display: grid; gap: 8px; margin-top: 12px; }
+  .check-item {
+    text-align: left; padding: 9px 14px; border: 0; border-radius: 6px; background: var(--lavender);
+    font-weight: 500; cursor: pointer; color: #2a1752;
+  }
+  .note, .error {
+    margin-top: 14px; padding: 10px 12px; border-radius: 8px; font-size: 13px; white-space: pre-wrap;
+  }
+  .note { background: #fff8e1; color: #5d4500; }
+  .note.info { background: #f3f2f6; color: var(--muted); }
+  .error { background: var(--danger-soft); color: var(--danger); }
+
+  .file {
+    display: flex; align-items: center; gap: 14px; padding: 12px 14px;
+    border: 1px solid var(--line); border-radius: 10px; background: #fff; box-shadow: 0 4px 14px rgba(30, 13, 51, 0.06);
+  }
+  .file svg { width: 34px; height: 40px; flex: none; }
+  .file .meta { flex: 1; min-width: 0; }
+  .file .meta b { display: block; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .file .meta small { color: var(--muted); }
+  .file-caption { margin: 6px 0 0; text-align: center; color: var(--muted); font-size: 12.5px; }
+
+  /* slides */
+  .slides-head { display: flex; align-items: baseline; justify-content: space-between; margin: 0 0 12px; }
+  .slides-head h2 { margin: 0; font-size: 15px; font-weight: 600; }
+  .slides-head span { color: var(--faint); font-size: 12.5px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 14px; }
+  .thumb { position: relative; margin: 0; }
+  .thumb img {
+    display: block; width: 100%; border: 1px solid var(--line); border-radius: 6px; background: #fff;
+  }
+  .thumb.check img { outline: 3px solid var(--purple); outline-offset: 0; border-color: var(--purple); }
+  .thumb figcaption { margin-top: 4px; font-size: 12px; color: var(--faint); display: flex; gap: 6px; align-items: center; }
+  .thumb .chip { background: var(--yellow); color: #3b3600; border-radius: 4px; padding: 0 6px; font-size: 11px; font-weight: 600; }
+  .thumb .chip.purple { background: var(--purple); color: #fff; }
+  .empty {
+    display: grid; place-items: center; text-align: center; min-height: 300px; padding: 24px;
+    border: 1px dashed var(--line); border-radius: 12px; color: var(--faint);
+  }
+  .skeleton { aspect-ratio: 16 / 9; border-radius: 6px; background: linear-gradient(90deg, #eeedf2, #f6f5f9, #eeedf2); background-size: 200% 100%; animation: shimmer 1.4s infinite; }
+  @keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+  @media (prefers-reduced-motion: reduce) { .skeleton { animation: none; } }
+</style>
+</head>
+<body>
+<header>
+  <span class="pill">Sanitize</span>
+  <span class="caption" id="caption"></span>
+  <div class="deck">
+    <span id="deckLabel">No deck open</span>
+    <button class="btn" id="openBtn" type="button">Open deck</button>
+    <input type="file" id="deckInput" accept=".pptx" hidden>
+  </div>
+</header>
+
+<div class="ribbon" role="toolbar" aria-label="Sanitize">
+  <button class="tool" data-mode="keywords" type="button" disabled>
+    <svg viewBox="0 0 32 32" aria-hidden="true"><path d="M4 9h8M4 23h8" stroke="#1b1820" stroke-width="2" stroke-linecap="round"/><rect x="15" y="6" width="13" height="5" rx="1" fill="#5300ff"/><rect x="4" y="14" width="24" height="4" rx="1" fill="#dcc3ff"/><path d="M15 23h13" stroke="#1b1820" stroke-width="2" stroke-linecap="round"/></svg>
+    <span>Mask Keywords</span>
+  </button>
+  <button class="tool" data-mode="all" type="button" disabled>
+    <svg viewBox="0 0 32 32" aria-hidden="true"><path d="M4 7h24" stroke="#1b1820" stroke-width="2" stroke-linecap="round"/><rect x="4" y="12" width="24" height="5" rx="1" fill="#5300ff"/><rect x="4" y="21" width="24" height="5" rx="1" fill="#dcc3ff"/></svg>
+    <span>Mask All</span>
+  </button>
+  <span class="sep"></span>
+  <button class="tool" data-mode="restore" type="button" disabled>
+    <svg viewBox="0 0 32 32" aria-hidden="true"><circle cx="8" cy="22" r="4" fill="none" stroke="#1b1820" stroke-width="2"/><path d="M12 22h16M24 22v4M20 22v3" stroke="#1b1820" stroke-width="2" stroke-linecap="round"/><path d="M9 11a7 7 0 1 1 3 6" fill="none" stroke="#5300ff" stroke-width="2" stroke-linecap="round"/><path d="M6 8l3 3 3-3" fill="none" stroke="#5300ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <span>Restore</span>
+  </button>
+  <span class="offline">No AI · fully offline</span>
+</div>
+
+<main>
+  <section class="card" id="card" aria-live="polite"></section>
+  <section id="slides" aria-label="Slides"></section>
+</main>
+
+<input type="file" id="keyInput" accept=".xlsx" hidden>
+
+<script>
+const SECRET = "{{SECRET}}";
+const CAPTIONS = {
+  start: "Open a deck to mask it before it goes to Prezlab, or to restore it when it comes back. Everything stays on this computer.",
+  idle: "Choose Mask Keywords, Mask All or Restore.",
+  keywords: "Type your own terms, one per line. Preview highlights every match, and after you confirm, each one becomes [X].",
+  all: "Preview highlights all text except slide titles. After you confirm, it becomes [X] and chart numbers become placeholders.",
+  files: "The redacted deck goes to Prezlab. The restore key stays on this computer.",
+  restore: "Pick the restore key. The real text returns, and a summary lists the slides to check for layout.",
+};
+const ICON = {
+  keywords: document.querySelector('[data-mode="keywords"] svg').outerHTML,
+  all: document.querySelector('[data-mode="all"] svg').outerHTML,
+  restore: document.querySelector('[data-mode="restore"] svg').outerHTML,
+  check: '<svg viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="13" fill="none" stroke="#5300ff" stroke-width="2.5"/><path d="M10 16.5l4 4 8-9" fill="none" stroke="#5300ff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  xlsx: '<svg viewBox="0 0 34 40" aria-hidden="true"><path d="M2 2h20l10 10v26H2z" fill="#f1f0f4" stroke="#1b1820" stroke-width="1.6" stroke-linejoin="round"/><path d="M22 2v10h10" fill="none" stroke="#1b1820" stroke-width="1.6" stroke-linejoin="round"/><text x="17" y="33" text-anchor="middle" font-size="8" font-weight="700" fill="#1b1820" font-family="Segoe UI, sans-serif">XLSX</text></svg>',
+  pptx: '<svg viewBox="0 0 34 40" aria-hidden="true"><path d="M2 2h20l10 10v26H2z" fill="#f2edff" stroke="#5300ff" stroke-width="1.6" stroke-linejoin="round"/><path d="M22 2v10h10" fill="none" stroke="#5300ff" stroke-width="1.6" stroke-linejoin="round"/><text x="17" y="33" text-anchor="middle" font-size="8" font-weight="700" fill="#5300ff" font-family="Segoe UI, sans-serif">PPTX</text></svg>',
+};
+
+const state = {
+  deck: null,          // name of the deck open in the page
+  data: null,          // that deck as base64, sent with every request (the script keeps nothing); masking and restoring replace it, like in PowerPoint
+  slides: null,        // slide images of what is shown (null: PowerPoint couldn't export them)
+  marked: [], check: [], // slides with highlights / slides to check after restore
+  view: "start", keywords: "", keyFile: null, error: "",
+  confirm: null,       // {title, text, ok} over the card
+  busy: "",            // text shown while working
+  result: null, preview: null,
+  base: null,          // slide images of the deck without highlights
+};
+
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+
+async function api(path, body) {
+  const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Sanitize": SECRET }, body: JSON.stringify(body) });
+  const j = await r.json().catch(() => ({ message: "Sanitize is not responding. Start it again, or reload the page." }));
+  if (!r.ok) throw j;
+  return j;
+}
+function readB64(file) {
+  return new Promise((ok, fail) => { const fr = new FileReader(); fr.onload = () => ok(fr.result.split(",")[1]); fr.onerror = fail; fr.readAsDataURL(file); });
+}
+function save(b64, name, type) {
+  const bin = atob(b64), bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const url = URL.createObjectURL(new Blob([bytes], { type }));
+  const a = Object.assign(document.createElement("a"), { href: url, download: name });
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+const PPTX = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+const XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+
+function footer(buttons) {
+  return `<footer><span class="offline">No AI · fully offline</span>${buttons}</footer>`;
+}
+function messagesHtml(list) {
+  return (list || []).map((m) => `<div class="note ${m.level === "note" ? "info" : ""}">${esc(m.text)}</div>`).join("");
+}
+
+function renderCard() {
+  const card = $("#card");
+  let html = "";
+  if (state.busy) {
+    html = `<div class="body busy"><div class="spinner">${Array.from({ length: 8 }, (_, i) => `<i style="transform:rotate(${i * 45}deg);animation-delay:${(i - 8) / 8}s"></i>`).join("")}</div><div>${esc(state.busy)}</div></div>${footer("")}`;
+  } else if (state.view === "start") {
+    html = `<div class="body"><h2>Open a deck</h2><p class="sub">Pick the .pptx to mask before sending it to Prezlab, or the deck that came back to restore it.</p>
+      ${state.error ? `<div class="error">${esc(state.error)}</div>` : ""}</div>
+      ${footer(`<button class="btn primary" data-act="open">Open deck</button>`)}`;
+  } else if (state.view === "idle") {
+    html = `<div class="body"><h2>What next?</h2><p class="sub">${esc(state.deck)} is open.</p><div class="choices">
+      <button class="choice" data-mode="keywords">${ICON.keywords}<span><b>Mask Keywords</b><small>Only your own terms become [X].</small></span></button>
+      <button class="choice" data-mode="all">${ICON.all}<span><b>Mask All</b><small>All text except slide titles becomes [X].</small></span></button>
+      <button class="choice" data-mode="restore">${ICON.restore}<span><b>Restore</b><small>Put the original text back with the restore key.</small></span></button>
+      </div>${state.error ? `<div class="error">${esc(state.error)}</div>` : ""}</div>${footer("")}`;
+  } else if (state.view === "keywords") {
+    html = `<div class="body"><h2>Mask Keywords</h2><p class="sub">Enter one term per line. Preview shows every match before anything is masked.</p>
+      <textarea id="kw" aria-label="Terms to mask, one per line" placeholder="Project Falcon&#10;Client name">${esc(state.keywords)}</textarea>
+      <p class="hint">Terms also match inside longer words. Add each Arabic spelling on its own line. Write "term | Label" to name a term in the key.</p>
+      ${state.error ? `<div class="error">${esc(state.error)}</div>` : ""}</div>
+      ${footer(`<button class="btn" data-act="cancel">Cancel</button><button class="btn primary" data-act="preview" ${state.keywords.trim() ? "" : "disabled"}>Preview</button>`)}`;
+  } else if (state.view === "all") {
+    html = `<div class="body"><h2>Mask All</h2><p class="sub">Preview highlights all text except slide titles. After you confirm, it becomes [X] and chart numbers become placeholders.</p>
+      ${state.error ? `<div class="error">${esc(state.error)}</div>` : ""}</div>
+      ${footer(`<button class="btn" data-act="cancel">Cancel</button><button class="btn primary" data-act="preview">Preview</button>`)}`;
+  } else if (state.view === "files") {
+    const r = state.result;
+    html = `<div class="body"><h2>Two files</h2><p class="sub">The redacted deck goes to Prezlab. The restore key stays on this computer.</p>
+      <h3>Kept on this computer</h3>
+      <div class="file">${ICON.xlsx}<div class="meta"><b title="${esc(r.key_name)}">${esc(r.key_name)}</b><small>Restore key</small></div><button class="btn" data-act="save-key">Save</button></div>
+      <p class="file-caption">Never send it: it holds every original value.</p>
+      <h3>Sent to Prezlab</h3>
+      <div class="file">${ICON.pptx}<div class="meta"><b title="${esc(r.deck_name)}">${esc(r.deck_name)}</b><small>Redacted deck</small></div><button class="btn" data-act="save-deck">Save</button></div>
+      <p class="file-caption">For formatting.</p>
+      ${messagesHtml(r.messages)}
+      </div>${footer(`<button class="btn primary" data-act="done">Done</button>`)}`;
+  } else if (state.view === "restore") {
+    html = `<div class="body"><h2>Restore</h2><p class="sub">Open the deck, then pick the restore key you saved when masking.</p>
+      <label class="field" for="keyName">Restore key</label>
+      <div class="row"><input id="keyName" readonly placeholder="No file selected" value="${esc(state.keyFile ? state.keyFile.name : "")}"><button class="btn" data-act="browse-key">Browse</button></div>
+      <p class="hint">A key made for a different deck is refused.</p>
+      ${state.error ? `<div class="error">${esc(state.error)}</div>` : ""}</div>
+      ${footer(`<button class="btn" data-act="cancel">Cancel</button><button class="btn primary" data-act="restore" ${state.keyFile ? "" : "disabled"}>Restore</button>`)}`;
+  } else if (state.view === "restored") {
+    const r = state.result;
+    const list = r.check.length
+      ? `<p class="sub">Real text is usually longer than [X]. Check the layout on these slides:</p><div class="check-list">${r.check.map((c) => `<button class="check-item" data-slide="${c.slide}">Slide ${c.slide}${c.title ? " · " + esc(c.title) : ""}</button>`).join("")}</div>`
+      : `<p class="sub">No slide needs a layout check.</p>`;
+    const title = r.restored === r.to_restore ? "Original text restored" : r.restored ? "Some text was not restored" : "Nothing was restored";
+    html = `<div class="body"><div class="done-title">${r.restored ? ICON.check : ""}<h2>${title}</h2></div>${r.restored ? list : ""}${messagesHtml(r.messages)}</div>
+      ${footer(`<button class="btn" data-act="done">Done</button><button class="btn primary" data-act="save-restored">Save deck</button>`)}`;
+  }
+  if (state.confirm && !state.busy) {
+    const c = state.confirm;
+    html += `<div class="confirm" role="dialog" aria-modal="true" aria-labelledby="confirmTitle"><div class="body"><h2 id="confirmTitle">${esc(c.title)}</h2><p class="sub">${esc(c.text)}</p></div>
+      ${footer(c.ok ? `<button class="btn" data-act="confirm-cancel">Cancel</button><button class="btn primary" data-act="mask">Mask</button>` : `<button class="btn primary" data-act="confirm-cancel">OK</button>`)}</div>`;
+  }
+  card.innerHTML = html;
+  const kw = $("#kw");
+  if (kw) kw.addEventListener("input", () => { state.keywords = kw.value; card.querySelector('[data-act="preview"]').disabled = !kw.value.trim(); });
+  const focus = card.querySelector(".confirm .btn.primary") || (kw && !state.confirm ? kw : null);
+  if (focus) focus.focus();
+}
+
+function renderSlides() {
+  const box = $("#slides");
+  if (!state.deck) { box.innerHTML = `<div class="empty">Slides appear here when a deck is open.</div>`; return; }
+  const head = `<div class="slides-head"><h2>Slides</h2><span>${state.slides ? state.slides.length + " shown" : ""}</span></div>`;
+  if (state.busy) { box.innerHTML = head + `<div class="grid">${"<div class='skeleton'></div>".repeat(4)}</div>`; return; }
+  if (!state.slides) {
+    box.innerHTML = head + `<div class="empty"><div>Slide previews need PowerPoint on this computer.${state.preview ? `<br><br><button class="btn" data-act="save-preview">Save the highlighted preview</button>` : ""}</div></div>`;
+    return;
+  }
+  box.innerHTML = head + `<div class="grid">${state.slides.map((src, i) => {
+    const n = i + 1, check = state.check.includes(n), marked = state.marked.includes(n);
+    return `<figure class="thumb ${check ? "check" : ""}" id="slide-${n}"><img src="${src}" alt="Slide ${n}">
+      <figcaption>Slide ${n}${marked ? '<span class="chip">highlighted</span>' : ""}${check ? '<span class="chip purple">check layout</span>' : ""}</figcaption></figure>`;
+  }).join("")}</div>`;
+}
+
+function render() {
+  $("#caption").textContent = CAPTIONS[state.view] || CAPTIONS[state.view === "restored" ? "restore" : "start"];
+  $("#deckLabel").innerHTML = state.deck ? `<strong title="${esc(state.deck)}">${esc(state.deck)}</strong>` : "No deck open";
+  $("#openBtn").textContent = state.deck ? "Open another deck" : "Open deck";
+  document.querySelectorAll(".ribbon .tool").forEach((t) => {
+    t.disabled = !state.deck || !!state.busy;
+    t.setAttribute("aria-pressed", String(t.dataset.mode === state.view || (t.dataset.mode === "restore" && state.view === "restored")));
+  });
+  renderCard();
+  renderSlides();
+}
+
+function go(view) {
+  Object.assign(state, { view, error: "", confirm: null, marked: [], check: [], preview: null });
+  if (state.base) state.slides = state.base; // back to the deck as it is, without highlights
+  render();
+}
+
+async function run(text, fn) {
+  state.busy = text; state.error = ""; render();
+  try { await fn(); }
+  catch (e) { state.error = e.message || String(e); state.confirm = null; }
+  finally { state.busy = ""; render(); }
+}
+
+async function openDeck(file) {
+  await run("Opening the deck", async () => {
+    const data = await readB64(file);
+    const j = await api("/api/open", { name: file.name, deck: data });
+    Object.assign(state, { deck: j.name, data, slides: j.slides, base: j.slides, view: "idle", keyFile: null, result: null, preview: null, marked: [], check: [] });
+  });
+  if (state.error && !state.deck) state.view = "start";
+  render();
+}
+
+async function preview() {
+  const mode = state.view;
+  await run(mode === "all" ? "Highlighting all text" : "Highlighting matches", async () => {
+    const j = await api("/api/preview", { mode, keywords: state.keywords, deck: state.data });
+    Object.assign(state, { slides: j.slides, marked: j.marked, preview: j.deck });
+    state.confirm = mode === "all"
+      ? { title: "Mask all text?", text: "The highlighted text becomes [X]. Slide titles stay readable, and chart numbers become placeholders.", ok: true }
+      : j.count
+        ? { title: `Mask ${j.count} ${j.count === 1 ? "match" : "matches"}?`, text: "The highlighted text becomes [X]. A restore key is saved so you can put it back.", ok: true }
+        : { title: "No matches", text: "None of these terms appear in the deck. Check the spelling: each Arabic spelling needs its own line.", ok: false };
+  });
+}
+
+async function mask() {
+  const mode = state.view;
+  state.confirm = null;
+  await run("Masking", async () => {
+    const j = await api("/api/mask", { mode, keywords: state.keywords, deck: state.data, name: state.deck });
+    Object.assign(state, { deck: j.deck_name, data: j.deck, slides: j.slides, base: j.slides, marked: [], result: j, preview: null, view: "files" });
+  });
+}
+
+async function restore() {
+  await run("Restoring your slides", async () => {
+    const j = await api("/api/restore", { key: await readB64(state.keyFile), deck: state.data, name: state.deck });
+    Object.assign(state, { deck: j.name, data: j.deck, slides: j.slides, base: j.slides, check: j.check.map((c) => c.slide), result: j, view: "restored", keyFile: null });
+  });
+}
+
+document.addEventListener("click", (e) => {
+  const el = e.target.closest("[data-act], [data-mode], [data-slide]");
+  if (!el || el.disabled) return;
+  if (el.dataset.mode) { go(el.dataset.mode); if (el.dataset.mode === "all") preview(); return; } // Mask All goes straight to its preview
+  if (el.dataset.slide) return $("#slide-" + el.dataset.slide)?.scrollIntoView({ behavior: "smooth", block: "center" });
+  const act = el.dataset.act, r = state.result;
+  if (act === "open") $("#deckInput").click();
+  else if (act === "cancel" || act === "done") go(state.deck ? "idle" : "start");
+  else if (act === "preview") preview();
+  else if (act === "confirm-cancel") cancelConfirm();
+  else if (act === "mask") mask();
+  else if (act === "browse-key") $("#keyInput").click();
+  else if (act === "restore") restore();
+  else if (act === "save-key") save(r.key, r.key_name, XLSX);
+  else if (act === "save-deck") save(r.deck, r.deck_name, PPTX);
+  else if (act === "save-restored") save(r.deck, r.name, PPTX);
+  else if (act === "save-preview") save(state.preview, state.deck.replace(/\.pptx$/i, "") + "_preview.pptx", PPTX);
+});
+$("#openBtn").addEventListener("click", () => $("#deckInput").click());
+$("#deckInput").addEventListener("change", (e) => { const f = e.target.files[0]; e.target.value = ""; if (f) openDeck(f); });
+$("#keyInput").addEventListener("change", (e) => { const f = e.target.files[0]; e.target.value = ""; if (f) { state.keyFile = f; state.error = ""; render(); } });
+function cancelConfirm() {
+  // Mask All has nothing to edit, so cancelling leaves it; Mask Keywords keeps the terms for another try
+  if (state.view === "all") return go("idle");
+  Object.assign(state, { confirm: null, slides: state.base, marked: [], preview: null });
+  render();
+}
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && state.confirm && !state.busy) cancelConfirm(); });
+render();
+</script>
+</body>
+</html>

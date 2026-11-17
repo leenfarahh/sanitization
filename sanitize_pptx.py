@@ -1,9 +1,9 @@
 
-#python sanitize_pptx.py deck.pptx --preview (yellow highlights + CSV report)
-#python sanitize_pptx.py deck.pptx (each confidential value becomes [X] + restore key .xlsx that stays with the client)
-#python sanitize_pptx.py deck.pptx --keywords keywords.txt (only the terms in keywords.txt become [X], emails/phones/IDs/IBANs/cards are left as they are)
+#python sanitize_pptx.py deck.pptx --preview (yellow highlights + CSV report; add --keywords or --all to see what those would mask)
+#python sanitize_pptx.py deck.pptx --keywords keywords.txt (only the terms in keywords.txt become [X] + restore key .xlsx that stays with the client)
 #python sanitize_pptx.py deck.pptx --all (all text except slide titles becomes [X], one per paragraph, line and formatting change; chart labels [X]; restorable with the key)
 #python sanitize_pptx.py returned_deck.pptx --restore deck_restore_key.xlsx (put the original values back)
+#add-in: preview_deck(), mask_all(), mask_keywords() and restore_deck() take and return files as bytes, nothing is read, written or printed
 
 import argparse
 import base64
@@ -285,6 +285,13 @@ def part_path(pkg, name):
     return "!".join([*pkg, name])
 
 
+class SanitizeError(Exception):
+    #stops a run with a message for the user; code lets the add-in react (e.g. offer "restore anyway" on wrong_key)
+    def __init__(self, code, text):
+        super().__init__(text)
+        self.code = code
+
+
 class Job:
     def __init__(self, keywords, labels, preview, full=False):
         self.keywords, self.labels, self.preview, self.full = keywords, labels, preview, full
@@ -313,7 +320,7 @@ class Job:
         #marker numbers are shared by X values and --all texts
         self.last_mark += 1
         if self.last_mark >= 1 << 16:
-            raise SystemExit("Too many different values and texts to mask in one deck (65,535 max)")
+            raise SanitizeError("too_many", "Too many different values and texts to mask in one deck (65,535 max)")
         return self.last_mark
 
     def xrun(self, rule, value, loc, numeric=False):
@@ -347,6 +354,9 @@ class Job:
     def mask_string(self, s, loc, label=False):
         if not any(ch.isalnum() for ch in s):
             return s
+        if self.preview: #--preview --all: report what would be masked, change nothing
+            self.log(loc, "CHART_LABEL" if label else "TEXT", s)
+            return s
         return bracket_text(s) + self.mark(s, loc, label)
 
     def string(self, s, loc, label=False):
@@ -355,6 +365,9 @@ class Job:
 
     def number(self, value, loc):
         #--all: chart and excel numbers become random placeholders, same number same placeholder.
+        if self.preview:
+            self.log(loc, "CHART_NUMBER", value)
+            return value
         ph = self.numbers.get(value)
         if ph is None:
             lo, hi = (101, 999) if len(self.numbers) < 400 else (1001, 9999)
@@ -367,6 +380,9 @@ class Job:
 
     def link(self, target, loc):
         #web links (--all) and email/phone links point to a placeholder address instead, same address same placeholder
+        if self.preview:
+            self.log(loc, "LINK", target)
+            return target
         tid = self.links.get(target)
         if tid is None:
             tid = self.links[target] = f"Link{len(self.links) + 1}"
@@ -585,22 +601,35 @@ def shown_format(run):
                     + [c.toxml() for c in children(rpr)])
 
 
-def mask_paragraph(p, job, loc):
-    #--all: a paragraph becomes [X], one per line and per formatting change, each in the first run of its piece.
-    #an invisible marker right after the last [X] carries the restore id
+def paragraph_pieces(p):
+    #the a:t of a paragraph's runs, grouped into what --all shows as one [X] each: a line break or formatting change starts a new one
     pieces, look = [], None
     for el in children(p, NS_A):
         t = first_child(el, NS_A, "t") if el.localName == "r" else None
         if el.localName == "br":
-            look = None #a line break starts a new [X]
+            look = None
         elif t is not None:
             if shown_format(el) != look:
                 pieces.append([])
                 look = shown_format(el)
             pieces[-1].append(t)
+    return pieces
+
+
+def mask_paragraph(p, job, loc):
+    #--all: a paragraph becomes [X], one per line and per formatting change, each in the first run of its piece.
+    #an invisible marker right after the last [X] carries the restore id
+    pieces = paragraph_pieces(p)
     text = "".join(get_text(t) for piece in pieces for t in piece)
     if not any(ch.isalnum() for ch in text):
         return False
+    if job.preview: #--preview --all: highlight what would become [X] (a piece with no letters or digits stays as it is)
+        job.log(loc, "TEXT", text)
+        for piece in pieces:
+            if any(ch.isalnum() for t in piece for ch in get_text(t)):
+                for t in piece:
+                    add_highlight(t.parentNode)
+        return True
     parts = []
     for piece in pieces:
         s = "".join(get_text(t) for t in piece)
@@ -1203,8 +1232,8 @@ def sheet_xml(widths, rows, yn):
             f'<cols>{cols}</cols><sheetData>{body}</sheetData>{choice}</worksheet>')
 
 
-def write_xlsx(path, sheets):
-    #sheets: [(name, column widths, rows, Y/N column index or None)], first row is the header
+def write_xlsx(sheets):
+    #sheets: [(name, column widths, rows, Y/N column index or None)], first row is the header; returns the .xlsx bytes
     decl = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n'
     ct = "application/vnd.openxmlformats-officedocument.spreadsheetml"
     rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -1234,14 +1263,16 @@ def write_xlsx(path, sheets):
     }
     for i, (_, widths, rows, yn) in enumerate(sheets, 1):
         parts[f"xl/worksheets/sheet{i}.xml"] = sheet_xml(widths, rows, yn)
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
         for name, xml in parts.items():
             z.writestr(name, (decl + xml).encode("utf-8"))
+    return out.getvalue()
 
 
-def read_xlsx(path):
+def read_xlsx(data):
     #{sheet name: rows as lists of strings}; also reads the file after Excel has re-saved it
-    z = zipfile.ZipFile(path)
+    z = zipfile.ZipFile(io.BytesIO(data))
     names = set(z.namelist())
     shared = []
     if "xl/sharedStrings.xml" in names:
@@ -1303,34 +1334,46 @@ def where(e):
     return "; ".join(out)
 
 
-def write_key(path, job, src):
+RESTORE_HINT = "Run restore on the returned deck and select this key file."
+MATCH_TEXT = {0: "same slide and position", 1: "same slide", 2: "other slide"}
+
+
+def review_notes(job):
+    #what to check by hand (images, embedded objects...), once per place: the key's Review notes sheet and the add-in panel
+    return [{"location": loc, "note": NOTE_TEXT.get(kind, kind)}
+            for loc, kind in dict.fromkeys((r[0], r[1]) for r in sorted(job.rows, key=row_order) if not r[2])]
+
+
+def build_key(job, src_name, restore_hint):
     rows = [KEY_HEADER]
     for e in sorted(job.entries.values(), key=lambda e: (KIND_ORDER[e["kind"]], id_order(e))):
         rows.append([e["id"], e["type"], e["value"], where(e), "Y", entry_details(e, job.placed[e["id"]])])
     for f in job.fields:
         rows.append([f["id"], f["type"], f["value"], "; ".join(f["locations"]), "Y", json.dumps(f["target"])])
-    notes = [["Location", "Note"]] + [
-        [loc, NOTE_TEXT.get(kind, kind)]
-        for loc, kind in dict.fromkeys((r[0], r[1]) for r in sorted(job.rows, key=row_order) if not r[2])]
+    notes = [["Location", "Note"]] + [[n["location"], n["note"]] for n in review_notes(job)]
     about = [["Item", "Value"],
-             ["Source deck", src.name],
+             ["Source deck", src_name],
              ["Redacted on", datetime.now().strftime("%d/%m/%Y %H:%M")],
              ["Deck ID", job.deck_id],
              ["Mode", "All text except slide titles replaced with [X] (--all)" if job.full
-                      else "Only the terms in the keyword list replaced with [X], one per value (--keywords)"
-                      if not job.rules else "Confidential details replaced with [X], one per value"],
+                      else "Only the terms in the keyword list replaced with [X], one per value (--keywords)"],
              ["Items", "Each [X] on a slide is numbered top to bottom (item 1 is highest). If a value's invisible marker "
                        "is lost, restore suggests unmarked [X]s in the same position, to check by hand."],
              ["Keep this file", "It holds the original values. Keep it on this machine and never send it with the deck."],
-             ["To restore", f"python sanitize_pptx.py <returned deck>.pptx --restore {path.name}"],
+             ["To restore", restore_hint],
              ["Restore only some items", "Set Restore (Y/N) to N for anything that should stay redacted."]]
-    write_xlsx(path, [("Restore key", [16, 24, 36, 44, 14, 40], rows, 4),
-                      ("Review notes", [30, 80], notes, None),
-                      ("About", [24, 90], about, None)])
+    return write_xlsx([("Restore key", [16, 24, 36, 44, 14, 40], rows, 4),
+                       ("Review notes", [30, 80], notes, None),
+                       ("About", [24, 90], about, None)])
 
 
-def read_key(path):
-    sheets = read_xlsx(path)
+def read_key(data):
+    try:
+        sheets = read_xlsx(data)
+    except (zipfile.BadZipFile, KeyError):
+        sheets = {}
+    if "Restore key" not in sheets:
+        raise SanitizeError("not_key", "This file is not a restore key (the .xlsx made when the deck was redacted).")
     head, *rows = sheets["Restore key"]
     col = {h: i for i, h in enumerate(head)}
     entries, fields = [], []
@@ -1356,101 +1399,177 @@ def read_key(path):
     about = {r[0]: r[1] for r in sheets.get("About", [])[1:] if len(r) > 1}
     return entries, fields, about.get("Deck ID")
 
-#command line
-def load_keywords(path):
-    #"term" or "term | Label"; the label names the term's id
+
+def parse_keywords(text):
+    #keyword list as text, one term per line: "term" or "term | Label"; the label names the term's id
     terms, labels = [], {}
-    for line in Path(path).read_text(encoding="utf-8").splitlines():
+    for line in text.removeprefix("﻿").splitlines(): #notepad's "UTF-8 with BOM" would glue the BOM to the first term
         term, _, label = line.partition("|")
         term, label = term.strip(), re.sub(r"\s+", "", label)
         if not term:
             continue
         if label[-1:].isdigit():
-            raise SystemExit(f"Label '{label}' for '{term}' must not end with a digit (IDs add their own number)")
+            raise SanitizeError("keyword_label",
+                                f"Label '{label}' for '{term}' must not end with a digit (IDs add their own number)")
         terms.append(term)
         if label:
             labels[term.translate(DIGIT_MAP).lower()] = label
     return terms, labels
 
 
-def redact(args):
-    keywords, labels = load_keywords(args.keywords) if args.keywords else ([], {})
-    if args.keywords and not keywords: #an empty list would redact nothing at all
-        raise SystemExit(f"{args.keywords} has no terms. Add one term per line, the deck was not redacted.")
-    src = Path(args.pptx)
-    job = Job(keywords, labels, args.preview, args.all)
-    result = process_package(src.read_bytes(), job)
+def check_deck(data):
+    #only .pptx decks (a zip holding ppt/presentation.xml); .ppt and other files stop the run
+    try:
+        ok = "ppt/presentation.xml" in zipfile.ZipFile(io.BytesIO(data)).namelist()
+    except zipfile.BadZipFile:
+        ok = False
+    if not ok:
+        raise SanitizeError("not_pptx", "This is not a .pptx deck. Save .ppt files as .pptx first.")
 
-    suffix = "_preview" if args.preview else "_redacted"
-    out = src.with_name(src.stem + suffix + src.suffix)
-    out.write_bytes(result)
+
+def message(level, code, text, items=()):
+    #a warning or note for the user: text as the command line prints it, items as data for the add-in to show its own way
+    return {"level": level, "code": code, "text": text, "items": list(items)}
+
+
+#entry points: files in and out as bytes, results as data. redact_deck has every mode (the command line uses it),
+#the add-in uses preview_deck, mask_all, mask_keywords and restore_deck
+def redact_deck(data, name="deck.pptx", keywords=None, preview=False, full=False, restore_hint=RESTORE_HINT):
+    """Redact a .pptx given as bytes. Modes: preview, full (--all) or a keyword list alone (--keywords).
+
+    name: the deck's file name, recorded in the key. keywords: the keyword list as text (one term per line, as in
+    keywords.txt), None for the built-in email/phone/ID/IBAN/card rules. preview: highlight what the other options
+    would mask, nothing removed. full: mask all text except slide titles (--all). restore_hint: how to restore,
+    shown in the key's About sheet.
+
+    Returns {"deck": redacted (or highlighted) deck, "key": restore key .xlsx (None with preview),
+    "report": preview report .csv and "findings": the same rows as data (both None without preview),
+    "notes": what to check by hand, "summary": counts + "text", "messages": [message()]}.
+    Raises SanitizeError when the run cannot go ahead (its code says why)."""
+    check_deck(data)
+    if keywords is None and not (preview or full): #masking only the detected values (the old default mode) was removed
+        raise SanitizeError("no_mode", "Choose a mode: preview, --all or --keywords.")
+    terms, labels = parse_keywords(keywords) if keywords is not None else ([], {})
+    if keywords is not None and not terms: #an empty list would redact nothing at all
+        raise SanitizeError("empty_keywords",
+                            "The keyword list has no terms. Add one term per line, the deck was not redacted.")
+    job = Job(terms, labels, preview, full)
+    result = process_package(data, job)
     found = sum(1 for r in job.rows if r[2])
+    notes = len(job.rows) - found
+    summary = {"preview": preview, "full": full, "keywords": bool(terms), "found": found, "review_notes": notes}
 
-    if args.preview:
-        rep = src.with_name(src.stem + suffix + "_report.csv")
-        with open(rep, "w", newline="", encoding="utf-8-sig") as f: #utf-8-sig opens cleanly in excel
-            w = csv.writer(f)
-            w.writerow(["location", "type", "masked_value"])
-            w.writerows(sorted(job.rows, key=row_order))
-        print(f"{found} items found, {len(job.rows) - found} review notes -> {out}\nReport -> {rep}")
-        return
+    if preview:
+        rows = sorted(job.rows, key=row_order)
+        report = io.StringIO(newline="")
+        w = csv.writer(report)
+        w.writerow(["location", "type", "masked_value"])
+        w.writerows(rows)
+        summary["text"] = (f"{found} items would be masked, {notes} review notes. Slide text is highlighted; chart data, "
+                           "links, alt text and file properties can't be, they are in the report" if full
+                           else f"{found} items found, {notes} review notes")
+        return {"deck": result, "key": None, "report": report.getvalue().encode("utf-8-sig"), #utf-8-sig opens cleanly in excel
+                "findings": [{"location": loc, "type": kind, "value": value} for loc, kind, value in rows if value],
+                "notes": review_notes(job), "summary": summary, "messages": []}
 
-    key_dir = Path(args.key_dir) if args.key_dir else src.parent
-    key_dir.mkdir(parents=True, exist_ok=True)
-    key = key_dir / (src.stem + "_restore_key.xlsx")
-    write_key(key, job, src)
     kinds = Counter(e["kind"] for e in job.entries.values())
-    if job.full:
-        print(f"{kinds['mask']} texts masked, {kinds['x']} values in titles masked with [X], "
-              f"{kinds['placeholder']} chart numbers replaced, {kinds['link']} links masked, "
-              f"{len(job.rows) - found} review notes -> {out}")
+    summary.update(deck_id=job.deck_id, values=kinds["x"], texts=kinds["mask"],
+                   chart_numbers=kinds["placeholder"], links=kinds["link"])
+    if full:
+        summary["text"] = (f"{kinds['mask']} texts masked, {kinds['x']} values in titles masked with [X], "
+                           f"{kinds['placeholder']} chart numbers replaced, {kinds['link']} links masked, "
+                           f"{notes} review notes")
     else:
-        print(f"{found} items masked with [X] ({kinds['x']} different values, {kinds['link']} email/phone links), "
-              f"{len(job.rows) - found} review notes -> {out}")
-    print(f"Restore key -> {key}\nKeep the key on this machine. Send only the redacted deck.")
+        summary["text"] = (f"{found} items masked with [X] ({kinds['x']} different values, {kinds['link']} email/phone links), "
+                           f"{notes} review notes")
 
     #self-check: every marker and placeholder must be found again exactly as often as it was placed
     check = Restore([{**e, "restore": True} for e in job.entries.values()])
     process_package(result, check)
-    off = [(i, n, check.found[i]) for i, n in job.placed.items() if check.found[i] != n]
+    off = [(i, n, check.found[i], "the deck already had redaction markers, was it redacted before?"
+            if check.found[i] > n else "could not be read back")
+           for i, n in job.placed.items() if check.found[i] != n]
+    messages = []
     if off:
-        print("WARNING: these items will not restore cleanly:")
-        for i, placed, seen in off:
-            why = "the deck already had redaction markers, was it redacted before?" if seen > placed else "could not be read back"
-            print(f"  {i}: placed {placed}, found {seen} ({why})")
+        messages.append(message(
+            "warning", "will_not_restore",
+            "WARNING: these items will not restore cleanly:\n"
+            + "\n".join(f"  {i}: placed {placed}, found {seen} ({why})" for i, placed, seen, why in off),
+            [{"id": i, "placed": placed, "found": seen, "reason": why} for i, placed, seen, why in off]))
+    return {"deck": result, "key": build_key(job, name, restore_hint), "report": None, "findings": None,
+            "notes": review_notes(job), "summary": summary, "messages": messages}
 
 
-def restore(args):
-    src = Path(args.pptx)
-    data = src.read_bytes()
-    entries, fields, key_id = read_key(Path(args.restore))
+#add-in: keywords is the keyword list as text (one term per line, "term | Label" names it in the key);
+#None, not an empty string, means the built-in detection (emails, phones, IDs, IBANs, cards)
+def preview_deck(data, keywords=None, full=False):
+    """Add-in preview (--preview): highlight what the built-in detection finds, or only the terms in the keyword list
+    when one is given; with full, everything mask_all would mask (--preview --all). Nothing removed.
+
+    Returns {"deck": highlighted deck, "findings": [{"location", "type", "value"}] (value: [X] + its last 4 characters),
+    "notes": [{"location", "note"}] to check by hand, "summary": counts + "text"}."""
+    r = redact_deck(data, keywords=keywords, preview=True, full=full)
+    return {k: r[k] for k in ("deck", "findings", "notes", "summary")}
+
+
+def mask_all(data, name="deck.pptx", keywords=None, restore_hint=RESTORE_HINT):
+    """Add-in --all: all text except slide titles becomes [X], chart labels [X], chart numbers placeholders. In titles
+    only detected values become [X] (only the keyword list's terms when one is given).
+
+    Returns {"deck": masked deck, "key": restore key .xlsx (it holds the originals: it stays on the client's machine),
+    "notes": [{"location", "note"}] to check by hand, "summary": counts + "text", "messages": [message()]}."""
+    r = redact_deck(data, name, keywords, full=True, restore_hint=restore_hint)
+    return {k: r[k] for k in ("deck", "key", "notes", "summary", "messages")}
+
+
+def mask_keywords(data, keywords, name="deck.pptx", restore_hint=RESTORE_HINT):
+    """Add-in --keywords: only the terms in the keyword list become [X], one per match; everything else stays readable.
+
+    Returns the same as mask_all. A list with no terms raises SanitizeError (empty_keywords)."""
+    r = redact_deck(data, name, keywords or "", restore_hint=restore_hint)
+    return {k: r[k] for k in ("deck", "key", "notes", "summary", "messages")}
+
+
+def restore_deck(data, key, force=False):
+    """Put the original values back into a returned deck: data is the deck (.pptx), key the restore key (.xlsx), as bytes.
+
+    force: restore even when the key was made for a different deck.
+    Returns {"deck": restored deck, "summary": counts + "text", "messages": [message()]}.
+    Raises SanitizeError when the run cannot go ahead (wrong_key: offer to restore anyway with force=True)."""
+    check_deck(data)
+    entries, fields, key_id = read_key(key)
     deck_id = read_deck_id(data)
-    if deck_id and key_id and deck_id != key_id and not args.force:
-        raise SystemExit("This key was made for a different deck (deck ids differ). "
-                         "Use the matching key, or add --force to restore anyway.")
+    if deck_id and key_id and deck_id != key_id and not force:
+        raise SanitizeError("wrong_key", "This key was made for a different deck (deck ids differ). "
+                                         "Use the matching key, or add --force to restore anyway.")
+    messages = []
     if not deck_id:
-        print("Note: this deck has no deck id (it may have been rebuilt in a new file), "
-              "so the key could not be matched to it. Make sure it is the right key.")
+        messages.append(message("note", "no_deck_id",
+                                "Note: this deck has no deck id (it may have been rebuilt in a new file), "
+                                "so the key could not be matched to it. Make sure it is the right key."))
 
     rj = Restore(entries, fields)
     result = process_package(data, rj)
-    out = src.with_name(src.stem + "_restored" + src.suffix)
-    out.write_bytes(result)
-
     wanted = [e["id"] for e in entries if e["restore"]]
     missing = [i for i in wanted if not rj.restored[i]]
     kept = [e["id"] for e in entries if not e["restore"]]
     short = lambda items: ", ".join(items[:20]) + (f" and {len(items) - 20} more" if len(items) > 20 else "")
-    print(f"Restored {len(wanted) - len(missing)} of {len(wanted)} items "
-          f"({sum(rj.restored.values())} places) -> {out}")
+    places = sum(rj.restored.values())
+    summary = {"restored": len(wanted) - len(missing), "to_restore": len(wanted), "places": places, "kept": len(kept),
+               "text": f"Restored {len(wanted) - len(missing)} of {len(wanted)} items ({places} places)"}
     if wanted and len(missing) == len(wanted):
-        print("WARNING: none of the key's items were found. Is this the right deck and key?")
+        messages.append(message("warning", "nothing_found",
+                                "WARNING: none of the key's items were found. Is this the right deck and key?", missing))
     elif missing:
-        print("Not found, restore by hand (see Locations in the key): " + short(missing))
+        messages.append(message("warning", "not_found",
+                                "Not found, restore by hand (see Locations in the key): " + short(missing), missing))
     partial = [e for e in entries if e["restore"] and 0 < rj.restored[e["id"]] < e.get("count", 0)]
     if partial:
-        print("Restored in fewer places than redacted (a marker was lost, or a copy was removed): "
-              + short([f"{e['id']} ({rj.restored[e['id']]} of {e['count']})" for e in partial]))
+        messages.append(message(
+            "warning", "partial",
+            "Restored in fewer places than redacted (a marker was lost, or a copy was removed): "
+            + short([f"{e['id']} ({rj.restored[e['id']]} of {e['count']})" for e in partial]),
+            [{"id": e["id"], "restored": rj.restored[e["id"]], "placed": e["count"]} for e in partial]))
     lost = [e for e in entries if e["kind"] == "x" and (e["id"] in missing or e in partial)]
     if lost and len(missing) < len(wanted):
         #backup: number every [X] per slide top to bottom, then match lost values by position
@@ -1460,42 +1579,93 @@ def restore(args):
         for runs in by_slide.values():
             for k, r in enumerate(sorted(runs, key=lambda r: r["pos"]), 1):
                 r["item"] = k
-        lines = []
+        lines, matches = [], []
         for e in lost:
             hits = suggestions(rj, e)
             if hits:
                 was = ", ".join(f"Slide {n} item {k}" for n, k in e["slots"]) or where(e)
-                tag = {0: " (same slide and position)", 1: " (same slide)", 2: ""}
                 lines.append(f"  {e['id']} (was {was}): "
-                             + ", ".join(f"Slide {n} item {k}{tag[rank]}" for rank, n, k in hits))
+                             + ", ".join(f"Slide {n} item {k}" + (f" ({MATCH_TEXT[rank]})" if rank < 2 else "")
+                                         for rank, n, k in hits))
+                matches.append({"id": e["id"], "was": was,
+                                "matches": [{"slide": n, "item": k, "match": MATCH_TEXT[rank]} for rank, n, k in hits]})
         if lines:
-            print("Possible matches by position, unmarked [X]s (check before restoring by hand):")
-            print("\n".join(lines[:20]) + (f"\n  and {len(lines) - 20} more" if len(lines) > 20 else ""))
+            messages.append(message(
+                "warning", "position_matches",
+                "Possible matches by position, unmarked [X]s (check before restoring by hand):\n"
+                + "\n".join(lines[:20]) + (f"\n  and {len(lines) - 20} more" if len(lines) > 20 else ""), matches))
     if kept:
-        print("Kept redacted (Restore = N): " + short(kept))
+        messages.append(message("note", "kept", "Kept redacted (Restore = N): " + short(kept), kept))
     if rj.older:
-        print("Masked by an older version of this tool, the originals were put back in full (check formatting): "
-              + ", ".join(sorted(rj.older, key=slide_key)))
+        older = sorted(rj.older, key=slide_key)
+        messages.append(message("warning", "older_version",
+                                "Masked by an older version of this tool, the originals were put back in full "
+                                "(check formatting): " + ", ".join(older), older))
     if rj.edited:
-        print("Masked text was edited here, the original was put back in full (check wording and formatting): "
-              + ", ".join(sorted(rj.edited, key=slide_key)))
+        edited = sorted(rj.edited, key=slide_key)
+        messages.append(message("warning", "edited",
+                                "Masked text was edited here, the original was put back in full "
+                                "(check wording and formatting): " + ", ".join(edited), edited))
     if rj.fields:
         left = [f for i, f in enumerate(rj.fields) if i not in rj.done]
-        print(f"File properties and comment authors restored: {len(rj.fields) - len(left)} of {len(rj.fields)}")
-        for (label, type_, inner), n in Counter((f["id"], f["type"], "!" in f["target"]["part"]) for f in left).items():
-            print(f"  not restored: {label} {type_}" + (f" in {n} embedded files" if inner else f" x{n}" if n > 1 else ""))
-        if any("!" in f["target"]["part"] for f in left):
-            print("  (embedded files such as chart data were renamed since redaction, "
-                  "decks redacted with this version keep track of them)")
+        summary.update(fields_restored=len(rj.fields) - len(left), fields=len(rj.fields))
+        groups = Counter((f["id"], f["type"], "!" in f["target"]["part"]) for f in left)
+        text = [f"File properties and comment authors restored: {len(rj.fields) - len(left)} of {len(rj.fields)}"]
+        text += [f"  not restored: {label} {type_}" + (f" in {n} embedded files" if inner else f" x{n}" if n > 1 else "")
+                 for (label, type_, inner), n in groups.items()]
+        if any(inner for _, _, inner in groups):
+            text.append("  (embedded files such as chart data were renamed since redaction, "
+                        "decks redacted with this version keep track of them)")
+        messages.append(message("warning" if left else "note", "fields", "\n".join(text),
+                                [{"id": label, "type": type_, "embedded": inner, "count": n}
+                                 for (label, type_, inner), n in groups.items()]))
     if rj.layout:
-        print("Check layout, restored text is longer than what was on the slide: "
-              + ", ".join(sorted(rj.layout, key=slide_key)))
+        layout = sorted(rj.layout, key=slide_key)
+        messages.append(message("warning", "check_layout",
+                                "Check layout, restored text is longer than what was on the slide: " + ", ".join(layout),
+                                layout))
+    return {"deck": result, "summary": summary, "messages": messages}
+
+#command line
+def redact(args):
+    src = Path(args.pptx)
+    keywords = Path(args.keywords).read_text(encoding="utf-8") if args.keywords else None
+    key_dir = Path(args.key_dir) if args.key_dir else src.parent
+    key = key_dir / (src.stem + "_restore_key.xlsx")
+    res = redact_deck(src.read_bytes(), src.name, keywords, args.preview, args.all,
+                      f"python sanitize_pptx.py <returned deck>.pptx --restore {key.name}")
+    out = src.with_name(src.stem + ("_preview" if args.preview else "_redacted") + src.suffix)
+    out.write_bytes(res["deck"])
+    if args.preview:
+        rep = src.with_name(src.stem + "_preview_report.csv")
+        rep.write_bytes(res["report"])
+        print(f"{res['summary']['text']} -> {out}\nReport -> {rep}")
+    else:
+        key_dir.mkdir(parents=True, exist_ok=True)
+        key.write_bytes(res["key"])
+        print(f"{res['summary']['text']} -> {out}\nRestore key -> {key}\n"
+              "Keep the key on this machine. Send only the redacted deck.")
+    for m in res["messages"]:
+        print(m["text"])
+
+
+def restore(args):
+    src = Path(args.pptx)
+    res = restore_deck(src.read_bytes(), Path(args.restore).read_bytes(), args.force)
+    out = src.with_name(src.stem + "_restored" + src.suffix)
+    out.write_bytes(res["deck"])
+    print(f"{res['summary']['text']} -> {out}")
+    for m in res["messages"]:
+        print(m["text"])
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Rule-based PII redaction for .pptx (no dependencies)")
+    ap = argparse.ArgumentParser(description="Mask a .pptx with --preview, --all or --keywords, put it back with --restore "
+                                             "(no dependencies)")
     ap.add_argument("pptx")
-    ap.add_argument("--preview", action="store_true", help="highlight only, no removal")
+    ap.add_argument("--preview", action="store_true",
+                    help="highlight what would be masked, no removal: the built-in detection, your terms with --keywords, "
+                         "all text with --all")
     ap.add_argument("--all", action="store_true",
                     help="mask all text except slide titles (each paragraph, line and formatting change -> [X], chart labels -> [X]), "
                          "chart numbers become placeholders; restorable with the key")
@@ -1505,12 +1675,16 @@ def main():
     ap.add_argument("--restore", metavar="KEY", help="put the original values back using this restore key (.xlsx)")
     ap.add_argument("--force", action="store_true", help="restore even if the key was made for a different deck")
     args = ap.parse_args()
-    if args.all and args.preview:
-        ap.error("--all cannot be combined with --preview")
-    if args.restore:
-        restore(args)
-    else:
-        redact(args)
+    if not (args.restore or args.preview or args.all or args.keywords):
+        ap.error("choose a mode: --preview, --all or --keywords FILE (or --restore KEY). "
+                 "Masking only the detected emails, phones and IDs is no longer a mode")
+    try:
+        if args.restore:
+            restore(args)
+        else:
+            redact(args)
+    except SanitizeError as e:
+        raise SystemExit(str(e))
 
 
 if __name__ == "__main__":

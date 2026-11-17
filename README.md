@@ -15,22 +15,73 @@ Works on **.pptx** only: save **.ppt** files as **.pptx** first
 | Goal | Command | Output |
 |---|---|---|
 | *See what would be caught* | **python sanitize_pptx.py deck.pptx --preview** | **deck_preview.pptx** (yellow highlights), **deck_preview_report.csv** |
-| *Mask personal details* | **python sanitize_pptx.py deck.pptx** | **deck_redacted.pptx**, **deck_restore_key.xlsx** |
+| *See what --all would mask* | **python sanitize_pptx.py deck.pptx --preview --all** | **deck_preview.pptx** (yellow highlights), **deck_preview_report.csv** |
 | *Mask only your own terms* | **python sanitize_pptx.py deck.pptx --keywords keywords.txt** | **deck_redacted.pptx**, **deck_restore_key.xlsx** |
 | *Mask all text and numbers* | **python sanitize_pptx.py deck.pptx --all** | **deck_redacted.pptx**, **deck_restore_key.xlsx** |
 | *Restore* | **python sanitize_pptx.py deck_redacted.pptx --restore deck_restore_key.xlsx** | **deck_redacted_restored.pptx** |
 
+- Every run needs a mode: **--preview**, **--all**, **--keywords** or **--restore**. There is no mode that masks only the detected emails, phones and IDs: list the values to mask with **--keywords**, or mask everything with **--all**.
+- **--preview** highlights what a run would mask and removes nothing: the built-in detection on its own, only your terms with **--keywords**, all text except slide titles with **--all**. Chart data, links, alt text and file properties can't be highlighted; they are listed in the report.
 - **--keywords file.txt** masks only the terms in the file, one per line. The built-in detection (emails, phones, IDs, IBANs, cards) is turned off. Name a term in the key with **term | Label**. An empty file stops the run and no deck is written.
 - **--key-dir folder** saves the key somewhere else.
-- **--force** restores even when the key was made for a different deck.
+- **--force** restores even when the key was made for a different deck. Avoid it: every deck numbers its markers the same way, so another deck's key puts its values into the wrong places without any warning.
 
 In the key workbook, **Restore key** sheet set **Restore(Y/N)** field to N for anything that should stay masked. The **Review notes** sheet lists what needs a manual check.
 
+## Desktop app
+
+Double-click **Sanitize** on the desktop. A small window offers three choices:
+
+- **Mask keywords**: type the terms, one per line, then choose the deck.
+- **Mask all**: choose the deck.
+- **Restore**: choose the deck that came back, then its restore key.
+
+Before masking, it says how many matches it found and on which slides; **Preview in PowerPoint** opens a highlighted copy to check first. Masking saves two files to Downloads: **deck_redacted.pptx** to send and **deck_restore_key.xlsx** to keep. Restore saves **deck_redacted_restored.pptx** and lists the slides to check for layout. Nothing is overwritten: when a name is taken, the deck and its key both get **(2)**.
+
+- Everything runs on the computer. Nothing is sent anywhere or logged, and typed terms are forgotten when the window closes. Highlighted previews are temporary copies, deleted when Sanitize starts or closes.
+- A key made for a different deck is refused, with no way to force it.
+
+### Setup on a computer
+
+1. Install Python 3.9 or later from **python.org** (tested with 3.12). In the installer, tick **Add Python to PATH** and keep **tcl/tk and IDLE** ticked. Use the python.org installer: Smart App Control can block other Python builds.
+2. Copy this folder to the computer, or clone the repository. The app needs **sanitize_pptx.py**, **sanitize_desktop.py** and **Setup Sanitize.bat**.
+3. Double-click **Setup Sanitize.bat**. It checks Python and puts a **Sanitize** shortcut on the desktop.
+
+There are no packages to install. Run the setup again after moving the folder or reinstalling Python: the shortcut points to both.
+
+## Browser view
+
+**python sanitize_app.py** opens the same tool as a page in the browser, laid out like the add-in and with slide previews: open a deck, then choose **Mask Keywords**, **Mask All** or **Restore**. Preview highlights what will be masked before you confirm. Masking gives two downloads, the redacted deck and the restore key: browsers save them to Downloads, so move the key somewhere safe and never send it. Restore lists the slides to check for layout.
+
+- It runs on this computer only (127.0.0.1) and loads nothing from the internet. Close the window running the script to stop it.
+- Slide previews are exported with PowerPoint, so they need PowerPoint on Windows; everything else works without it. Only the first 60 slides are shown.
+- A key made for a different deck is refused, with no way to force it.
+
+## Using it from other code
+
+These functions do the same work as the commands on files held in memory: decks and keys go in and come out as bytes, and nothing is read from or written to disk or printed. **sanitize_desktop.py** and **sanitize_app.py** are built on them.
+
+The PowerPoint add-in does not run this file. It uses a C# port that lives with the add-in's code, not in this repository, so a change to the masking or restore logic here needs the same change there.
+
+| Call | Same as | Returns |
+|---|---|---|
+| **preview_deck(deck, keywords=None, full=False)** | **--preview** (**full=True**: **--preview --all**) | **deck** (highlighted), **findings**, **notes**, **summary** |
+| **mask_all(deck, name, keywords=None)** | **--all** | **deck**, **key** (.xlsx), **notes**, **summary**, **messages** |
+| **mask_keywords(deck, keywords, name)** | **--keywords** | **deck**, **key** (.xlsx), **notes**, **summary**, **messages** |
+| **restore_deck(deck, key, force=False)** | **--restore** | **deck**, **summary**, **messages** |
+
+- **keywords** is the keyword list as text, in the same format as keywords.txt. In **preview_deck** and **mask_all** it is optional and works like adding **--keywords** to the command: **None** (not an empty string) uses the built-in detection.
+- **findings** are the rows of the preview report: location, type and value (**[X]** plus its last 4 characters).
+- **notes** are what to check by hand (text in images, embedded objects and so on), the same as the key's **Review notes** sheet. Show them in any interface built on these functions: nobody opens the key to read them.
+- **messages** are the warnings and notes the commands print (not found, will not restore cleanly, check layout and so on). Each has a **level** (warning or note), a **code**, the **text** and the affected **items** as data. Show them to the user: they are the safety net.
+- A problem that stops the run raises **SanitizeError** with a **code**: **not_pptx**, **not_key**, **wrong_key**, **empty_keywords**, **keyword_label** (a label ending in a digit), **too_many**. On **wrong_key**, ask for the matching key. Don't offer a forced restore in an interface (see **--force** above).
+- **mask_all** and **mask_keywords** take an optional **restore_hint**, the "To restore" line in the key's About sheet. The default doesn't mention the command line.
+
 ## What gets masked
 
-**Default mode:** each detected value becomes a single **[X]**, whatever its length, so a slide or table full of values stays readable (**+971 50 123 4567** becomes **[X]**). It detects emails, UAE/KSA/Jordan/Qatar phone numbers and IBANs, payment cards, Emirates ID, Saudi ID/Iqama, Qatar QID, Jordan national number and passport numbers. Everything else stays readable.
+**Built-in detection** (what **--preview** highlights on its own, and what **--all** masks in slide titles): emails, UAE/KSA/Jordan/Qatar phone numbers and IBANs, payment cards, Emirates ID, Saudi ID/Iqama, Qatar QID, Jordan national number and passport numbers.
 
-**--keywords mode:** only the terms in your file are masked, each match becoming a single **[X]**. Emails, phones, IDs, IBANs and cards stay as they are. With **--preview** it highlights only your terms; with **--all** it limits what is masked in slide titles to your terms.
+**--keywords mode:** only the terms in your file are masked, each match becoming a single **[X]** whatever its length, so a slide or table full of values stays readable (**Project Falcon** becomes **[X]**). Everything else stays readable, including emails, phones, IDs, IBANs and cards. With **--preview** it highlights only your terms; with **--all** it limits what is masked in slide titles to your terms.
 
 **--all mode:** all text except slide titles becomes **[X]**: one per paragraph, plus one for each line break and each formatting change, so a bold lead-in keeps its bold on restore (**Note:** driven by retail becomes **[X]** [X]). Chart labels become **[X]**, and chart and Excel numbers become random placeholders. Web links point to a placeholder address.
 
@@ -51,7 +102,7 @@ In the key workbook, **Restore key** sheet set **Restore(Y/N)** field to N for a
 
 ### Detection
 
-- Default mode only finds the patterns listed above. Names, companies, addresses, amounts and project names are missed.
+- The built-in detection only finds the patterns listed above. Names, companies, addresses, amounts and project names are missed in previews and slide titles.
 - **--keywords** finds only your terms, so the patterns above are not detected in the same run. The two cannot be combined.
 - Phones and IBANs from other countries (Kuwait, Bahrain, Oman, Egypt and so on) are missed.
 - Passport, Jordan national and Qatar QID numbers are only caught with a label such as "passport" or "national no" within 40 characters before them.
@@ -67,7 +118,7 @@ In the key workbook, **Restore key** sheet set **Restore(Y/N)** field to N for a
 - Chart placeholders (101 to 999) ignore fixed axis limits and number formats.
 ### Restore
 
-- Each masked text ends in an invisible marker. Retyping the text, or deleting its last character, breaks the marker. That value is then reported as not found and has to be restored by hand from the key. For default-mode **[X]**s, restore suggests likely matches by position for someone to confirm. Decks masked by an older version of this tool still restore with their keys, but each masked text comes back whole in one formatting, and the slides are listed to check formatting. Their comment authors have to be restored by hand from the key.
+- Each masked text ends in an invisible marker. Retyping the text, or deleting its last character, breaks the marker. That value is then reported as not found and has to be restored by hand from the key. For **[X]**s from **--keywords** and in **--all** slide titles, restore suggests likely matches by position for someone to confirm. Decks masked by an older version of this tool still restore with their keys, but each masked text comes back whole in one formatting, and the slides are listed to check formatting. Their comment authors have to be restored by hand from the key.
 - If a masked text is split across several text boxes, the full original goes back into the box holding the marker and the others keep their **[X]**. The slide is listed as edited.
 - Chart numbers restore by their placeholder values. A chart with retyped data cannot be restored, and a new value that happens to equal a placeholder gets swapped.
 - Restored text can be longer than what the designer laid out. Affected slides are listed for a layout check. This is most slides with masked text, since **[X]** is shorter than almost anything it hides.
