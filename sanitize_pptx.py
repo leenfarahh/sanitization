@@ -2,6 +2,7 @@
 #python sanitize_pptx.py deck.pptx --preview (yellow highlights + CSV report; add --keywords or --all to see what those would mask)
 #python sanitize_pptx.py deck.pptx --keywords keywords.txt (only the terms in keywords.txt become [X] + restore key .xlsx that stays with the client)
 #python sanitize_pptx.py deck.pptx --all (all text except slide titles becomes [X], one per paragraph, line and formatting change; chart labels [X]; restorable with the key)
+#python sanitize_pptx.py deck.pptx --all --titles (the same, slide titles included: no text stays readable)
 #python sanitize_pptx.py returned_deck.pptx --restore deck_restore_key.xlsx (put the original values back)
 #add-in: preview_deck(), mask_all(), mask_keywords() and restore_deck() take and return files as bytes, nothing is read, written or printed
 
@@ -190,7 +191,7 @@ LAYOUT_GROWTH = 5 #restored text this many characters longer than what was on th
 #--all mode: each paragraph becomes [X], one more for each line break and formatting change (a bold lead-in), so every
 #piece goes back with its own formatting; chart labels [X] too. the key records where each piece starts and ends.
 #each masked value or text ends with an invisible marker (zero-width characters) holding its restore id: 16-bit id + 4-bit check
-TITLE_PH = {"title", "ctrTitle"} #slide titles stay readable
+TITLE_PH = {"title", "ctrTitle"} #slide titles stay readable in --all, unless --titles masks them too
 CORE_TEXT = {"title", "subject", "keywords", "description", "category", "contentStatus"}
 MARK_EDGE, MARK_0, MARK_1 = "\u2060", "\u200b", "\u200c" #word joiner, zero-width space, zero-width non-joiner
 MARK_RX = re.compile(f"{MARK_EDGE}([{MARK_0}{MARK_1}]{{20}}){MARK_EDGE}")
@@ -293,8 +294,9 @@ class SanitizeError(Exception):
 
 
 class Job:
-    def __init__(self, keywords, labels, preview, full=False):
+    def __init__(self, keywords, labels, preview, full=False, titles=False):
         self.keywords, self.labels, self.preview, self.full = keywords, labels, preview, full
+        self.titles = full and titles #--all --titles: slide titles become [X] like all other text
         self.rules = [] if keywords else COMPILED #a keyword list replaces the built-in rules: only its terms are redacted
         self.rows = []
         self.ids, self.entries, self.fields = {}, {}, []
@@ -519,7 +521,7 @@ def chart_number(el):
 
 
 def title_paragraphs(root):
-    #paragraphs inside slide title placeholders, which stay readable in --all mode
+    #paragraphs inside slide title placeholders, which stay readable in --all mode (not with --titles)
     keep = set()
     for sp in root.getElementsByTagNameNS(NS_P, "sp"):
         ph = sp.getElementsByTagNameNS(NS_P, "ph")
@@ -663,7 +665,7 @@ def process_xml(name, data, job, loc):
             elif job.full and rel.getAttribute("Type").endswith("/hyperlink"): #web and file links
                 rel.setAttribute("Target", job.link(t, here))
     else:
-        titles = title_paragraphs(root) if job.full else set()
+        titles = title_paragraphs(root) if job.full and not job.titles else set()
         slide = bool(SLIDE_RX.match(name)) and not job.pkg and slide_no(loc) is not None
         paras = root.getElementsByTagNameNS(NS_A, "p")
         job.spots = [] if slide else None
@@ -1355,7 +1357,8 @@ def build_key(job, src_name, restore_hint):
              ["Source deck", src_name],
              ["Redacted on", datetime.now().strftime("%d/%m/%Y %H:%M")],
              ["Deck ID", job.deck_id],
-             ["Mode", "All text except slide titles replaced with [X] (--all)" if job.full
+             ["Mode", "All text, slide titles included, replaced with [X] (--all --titles)" if job.titles
+                      else "All text except slide titles replaced with [X] (--all)" if job.full
                       else "Only the terms in the keyword list replaced with [X], one per value (--keywords)"],
              ["Items", "Each [X] on a slide is numbered top to bottom (item 1 is highest). If a value's invisible marker "
                        "is lost, restore suggests unmarked [X]s in the same position, to check by hand."],
@@ -1434,13 +1437,14 @@ def message(level, code, text, items=()):
 
 #entry points: files in and out as bytes, results as data. redact_deck has every mode (the command line uses it),
 #the add-in uses preview_deck, mask_all, mask_keywords and restore_deck
-def redact_deck(data, name="deck.pptx", keywords=None, preview=False, full=False, restore_hint=RESTORE_HINT):
+def redact_deck(data, name="deck.pptx", keywords=None, preview=False, full=False, restore_hint=RESTORE_HINT,
+                titles=False):
     """Redact a .pptx given as bytes. Modes: preview, full (--all) or a keyword list alone (--keywords).
 
     name: the deck's file name, recorded in the key. keywords: the keyword list as text (one term per line, as in
     keywords.txt), None for the built-in email/phone/ID/IBAN/card rules. preview: highlight what the other options
-    would mask, nothing removed. full: mask all text except slide titles (--all). restore_hint: how to restore,
-    shown in the key's About sheet.
+    would mask, nothing removed. full: mask all text except slide titles (--all). titles: with full, mask slide
+    titles too (--all --titles). restore_hint: how to restore, shown in the key's About sheet.
 
     Returns {"deck": redacted (or highlighted) deck, "key": restore key .xlsx (None with preview),
     "report": preview report .csv and "findings": the same rows as data (both None without preview),
@@ -1453,11 +1457,12 @@ def redact_deck(data, name="deck.pptx", keywords=None, preview=False, full=False
     if keywords is not None and not terms: #an empty list would redact nothing at all
         raise SanitizeError("empty_keywords",
                             "The keyword list has no terms. Add one term per line, the deck was not redacted.")
-    job = Job(terms, labels, preview, full)
+    job = Job(terms, labels, preview, full, titles)
     result = process_package(data, job)
     found = sum(1 for r in job.rows if r[2])
     notes = len(job.rows) - found
-    summary = {"preview": preview, "full": full, "keywords": bool(terms), "found": found, "review_notes": notes}
+    summary = {"preview": preview, "full": full, "titles": job.titles, "keywords": bool(terms), "found": found,
+               "review_notes": notes}
 
     if preview:
         rows = sorted(job.rows, key=row_order)
@@ -1475,7 +1480,11 @@ def redact_deck(data, name="deck.pptx", keywords=None, preview=False, full=False
     kinds = Counter(e["kind"] for e in job.entries.values())
     summary.update(deck_id=job.deck_id, values=kinds["x"], texts=kinds["mask"],
                    chart_numbers=kinds["placeholder"], links=kinds["link"])
-    if full:
+    if job.titles:
+        summary["text"] = (f"{kinds['mask']} texts masked (slide titles included), "
+                           f"{kinds['placeholder']} chart numbers replaced, {kinds['link']} links masked, "
+                           f"{notes} review notes")
+    elif full:
         summary["text"] = (f"{kinds['mask']} texts masked, {kinds['x']} values in titles masked with [X], "
                            f"{kinds['placeholder']} chart numbers replaced, {kinds['link']} links masked, "
                            f"{notes} review notes")
@@ -1502,23 +1511,25 @@ def redact_deck(data, name="deck.pptx", keywords=None, preview=False, full=False
 
 #add-in: keywords is the keyword list as text (one term per line, "term | Label" names it in the key);
 #None, not an empty string, means the built-in detection (emails, phones, IDs, IBANs, cards)
-def preview_deck(data, keywords=None, full=False):
+def preview_deck(data, keywords=None, full=False, titles=False):
     """Add-in preview (--preview): highlight what the built-in detection finds, or only the terms in the keyword list
-    when one is given; with full, everything mask_all would mask (--preview --all). Nothing removed.
+    when one is given; with full, everything mask_all would mask (--preview --all), slide titles too with titles
+    (--preview --all --titles). Nothing removed.
 
     Returns {"deck": highlighted deck, "findings": [{"location", "type", "value"}] (value: [X] + its last 4 characters),
     "notes": [{"location", "note"}] to check by hand, "summary": counts + "text"}."""
-    r = redact_deck(data, keywords=keywords, preview=True, full=full)
+    r = redact_deck(data, keywords=keywords, preview=True, full=full, titles=titles)
     return {k: r[k] for k in ("deck", "findings", "notes", "summary")}
 
 
-def mask_all(data, name="deck.pptx", keywords=None, restore_hint=RESTORE_HINT):
+def mask_all(data, name="deck.pptx", keywords=None, restore_hint=RESTORE_HINT, titles=False):
     """Add-in --all: all text except slide titles becomes [X], chart labels [X], chart numbers placeholders. In titles
-    only detected values become [X] (only the keyword list's terms when one is given).
+    only detected values become [X] (only the keyword list's terms when one is given). titles: slide titles become
+    [X] too, like all other text (--all --titles), and keywords then only matter outside slide text.
 
     Returns {"deck": masked deck, "key": restore key .xlsx (it holds the originals: it stays on the client's machine),
     "notes": [{"location", "note"}] to check by hand, "summary": counts + "text", "messages": [message()]}."""
-    r = redact_deck(data, name, keywords, full=True, restore_hint=restore_hint)
+    r = redact_deck(data, name, keywords, full=True, restore_hint=restore_hint, titles=titles)
     return {k: r[k] for k in ("deck", "key", "notes", "summary", "messages")}
 
 
@@ -1633,7 +1644,7 @@ def redact(args):
     key_dir = Path(args.key_dir) if args.key_dir else src.parent
     key = key_dir / (src.stem + "_restore_key.xlsx")
     res = redact_deck(src.read_bytes(), src.name, keywords, args.preview, args.all,
-                      f"python sanitize_pptx.py <returned deck>.pptx --restore {key.name}")
+                      f"python sanitize_pptx.py <returned deck>.pptx --restore {key.name}", titles=args.titles)
     out = src.with_name(src.stem + ("_preview" if args.preview else "_redacted") + src.suffix)
     out.write_bytes(res["deck"])
     if args.preview:
@@ -1669,6 +1680,8 @@ def main():
     ap.add_argument("--all", action="store_true",
                     help="mask all text except slide titles (each paragraph, line and formatting change -> [X], chart labels -> [X]), "
                          "chart numbers become placeholders; restorable with the key")
+    ap.add_argument("--titles", action="store_true",
+                    help="with --all: mask slide titles too, on slides, layouts and the master, so no text stays readable")
     ap.add_argument("--keywords", help="text file, one term per line: only these terms are redacted, the built-in "
                                        "email/phone/ID/IBAN/card rules are off; 'term | Label' names it in the key")
     ap.add_argument("--key-dir", help="folder for the restore key (default: next to the deck)")
@@ -1678,6 +1691,8 @@ def main():
     if not (args.restore or args.preview or args.all or args.keywords):
         ap.error("choose a mode: --preview, --all or --keywords FILE (or --restore KEY). "
                  "Masking only the detected emails, phones and IDs is no longer a mode")
+    if args.titles and not args.all:
+        ap.error("--titles only works with --all (--all --titles masks all text, slide titles included)")
     try:
         if args.restore:
             restore(args)

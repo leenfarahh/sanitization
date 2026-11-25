@@ -1,6 +1,7 @@
 """Desktop app for sanitize_pptx.py: the "Sanitize" desktop shortcut opens it through pythonw.exe (no console window).
 
-A small window offers Mask keywords, Mask all and Restore; the new files are saved to Downloads.
+A small window offers Mask keywords, Mask all, Full masking (all text, slide titles included) and Restore; the new
+files are saved to Downloads.
 Everything runs on this computer: nothing is sent anywhere, logged or kept. Typed terms are forgotten when the
 window closes, and highlighted previews are temporary copies, deleted when Sanitize starts or closes.
 
@@ -122,12 +123,14 @@ def clear_previews() -> None:
 
 # flows: ui is TkUI, or a stand-in with the same methods in tests
 def mask_flow(ui, mode: str, terms: str, out_dir: Path) -> None:
-    full = mode == "all"
+    titles = mode == "full"  # Full masking: Mask all with slide titles masked too
+    full = mode == "all" or titles
     deck = ui.pick_file("Choose the deck to mask", DECKS)
     if deck is None:
         return
     data = deck.read_bytes()
-    preview = ui.busy(f"Checking {deck.name}", lambda: sp.preview_deck(data, None if full else terms, full=full))
+    preview = ui.busy(f"Checking {deck.name}",
+                      lambda: sp.preview_deck(data, None if full else terms, full=full, titles=titles))
     found = [f for f in preview["findings"] if not f["type"].startswith("METADATA_")]  # file properties are always cleared
     if not found:
         ui.info(f"{deck.name} has no text to mask." if full else
@@ -136,8 +139,9 @@ def mask_flow(ui, mode: str, terms: str, out_dir: Path) -> None:
     slides = slides_in(f["location"] for f in found)
     if full:
         charts = ", and chart numbers become placeholders" if any(f["type"] == "CHART_NUMBER" for f in found) else ""
-        title = "Mask all text?"
-        text = "All text except slide titles becomes [X]" +(f" on {slide_list(slides)}" if slides else "") + charts + "."
+        title = "Mask all text and titles?" if titles else "Mask all text?"
+        text = ("All text, slide titles included, becomes [X]" if titles else "All text except slide titles becomes [X]")
+        text += (f" on {slide_list(slides)}" if slides else "") + charts + "."
     else:
         title = f"Mask {len(found)} {'match' if len(found) == 1 else 'matches'}?"
         text = (f"Found on {slide_list(slides)}. " if slides else "") + "Each match becomes [X]."
@@ -146,7 +150,8 @@ def mask_flow(ui, mode: str, terms: str, out_dir: Path) -> None:
         return
 
     if full:
-        result = ui.busy(f"Masking {deck.name}", lambda: sp.mask_all(data, deck.name, restore_hint=RESTORE_HINT))
+        result = ui.busy(f"Masking {deck.name}",
+                         lambda: sp.mask_all(data, deck.name, restore_hint=RESTORE_HINT, titles=titles))
     else:
         result = ui.busy(f"Masking {deck.name}",
                          lambda: sp.mask_keywords(data, terms, deck.name, restore_hint=RESTORE_HINT))
@@ -154,7 +159,8 @@ def mask_flow(ui, mode: str, terms: str, out_dir: Path) -> None:
     out.write_bytes(result["deck"])
     key.write_bytes(result["key"])
 
-    head = (f"All text except slide titles is masked in {deck.name}." if full
+    head = (f"All text, slide titles included, is masked in {deck.name}." if titles
+            else f"All text except slide titles is masked in {deck.name}." if full
             else f"{len(found)} {'match' if len(found) == 1 else 'matches'} masked in {deck.name}.")
     lines = [head, "", f"Saved to {out_dir.name}:", "", out.name, "Send this one.", "",
              key.name, "Keep it on this computer and never send it: it holds the original text."]
@@ -289,7 +295,7 @@ class TkUI:
         self._root.wait_window(window)
 
     def start(self) -> tuple[str, str] | None:
-        """The start window: ("keywords", terms), ("all", ""), ("restore", "") or None when closed."""
+        """The start window: ("keywords", terms), ("all", ""), ("full", ""), ("restore", "") or None when closed."""
         window = self._window()
         chosen: list[tuple[str, str]] = []
 
@@ -342,6 +348,8 @@ class TkUI:
         self._button(row, "Choose deck", lambda: choose("keywords")).pack(side="right", padx=(16, 0))
         rule()
         section("Mask all", "All text except slide titles becomes [X].", "Choose deck", lambda: choose("all"))
+        rule()
+        section("Full masking", "All text becomes [X], slide titles included.", "Choose deck", lambda: choose("full"))
         rule()
         section("Restore", "Put the original text back, using the deck's restore key.", "Choose returned deck",
                 lambda: choose("restore"))

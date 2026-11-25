@@ -25,7 +25,6 @@ import shutil
 import struct
 import subprocess
 import sys
-import tempfile
 from datetime import date
 from pathlib import Path
 
@@ -129,7 +128,7 @@ def main() -> None:
     iscc = find_iscc()
     today = date.today()
     version = f"{today.year}.{today.month}.{today.day}"
-    with tempfile.TemporaryDirectory(prefix="sanitize-build-") as tmp:
+    with build_icon.scratch_folder() as tmp:
         folder = Path(tmp)
         print("Copying Python and the app...")
         app = stage(folder)

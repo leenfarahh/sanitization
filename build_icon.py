@@ -9,10 +9,13 @@ doesn't need this.
 from __future__ import annotations
 
 import os
+import shutil
 import struct
 import subprocess
 import sys
 import tempfile
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -28,6 +31,17 @@ def find_edge() -> Path:
     sys.exit("Microsoft Edge was not found; it renders the SVG.")
 
 
+@contextmanager
+def scratch_folder(prefix: str = "sanitize-build-"):
+    """A temporary folder, deleted afterwards as far as possible: Edge can keep its profile files open for a few
+    seconds after a screenshot, and a file it still holds must not fail the build."""
+    folder = tempfile.mkdtemp(prefix=prefix)
+    try:
+        yield folder
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
 def screenshot(edge: Path, html: str, width: int, height: int, folder: Path, scale: int = 1) -> bytes:
     """The page as a PNG of width x height CSS pixels times scale, transparent where the page has no background.
     build_installer.py renders the installer's images with it too."""
@@ -39,7 +53,14 @@ def screenshot(edge: Path, html: str, width: int, height: int, folder: Path, sca
                     f"--user-data-dir={folder / 'profile'}", f"--window-size={width},{height}", f"--screenshot={out}",
                     page.as_uri()],
                    capture_output=True, timeout=120)
-    png = out.read_bytes() if out.exists() else b""
+    # Edge 158 and later hands the work to another process and returns at once: wait for the finished PNG
+    png, deadline = b"", time.monotonic() + 60
+    while not png.endswith(b"IEND\xaeB`\x82") and time.monotonic() < deadline:
+        time.sleep(0.2)
+        try:
+            png = out.read_bytes() if out.exists() else b""
+        except OSError:  # still being written
+            png = b""
     if not png.startswith(b"\x89PNG\r\n\x1a\n") or struct.unpack(">II", png[16:24]) != (width * scale, height * scale):
         sys.exit(f"Edge did not render the {width * scale} x {height * scale} px image.")
     return png
@@ -63,7 +84,7 @@ def ico(pngs: dict[int, bytes]) -> bytes:
 
 def main() -> None:
     edge = find_edge()
-    with tempfile.TemporaryDirectory() as folder:
+    with scratch_folder() as folder:
         pngs = {size: render(edge, size, Path(folder)) for size in SIZES}
     ICO.write_bytes(ico(pngs))
     print(f"{ICO.name}: {', '.join(map(str, SIZES))} px, {ICO.stat().st_size:,} bytes")
