@@ -30,7 +30,7 @@ In the key workbook, **Restore key** sheet set **Restore(Y/N)** field to N for a
 
 ## Desktop app
 
-Double-click **Sanitize** on the desktop. A small window offers three choices:
+Open **Sanitize** from the desktop or the Start menu (see **Installing** below). A small window offers three choices:
 
 - **Mask keywords**: type the terms, one per line, then choose the deck.
 - **Mask all**: choose the deck.
@@ -41,15 +41,24 @@ Before masking, it says how many matches it found and on which slides; **Preview
 - Everything runs on the computer. Nothing is sent anywhere or logged, and typed terms are forgotten when the window closes. Highlighted previews are temporary copies, deleted when Sanitize starts or closes.
 - A key made for a different deck is refused, with no way to force it.
 
-### Setup on a computer
+### Installing
 
-1. Install Python 3.9 or later from **python.org** (tested with 3.12). In the installer, tick **Add Python to PATH** and keep **tcl/tk and IDLE** ticked. Use the python.org installer: Smart App Control can block other Python builds.
-2. Copy this folder to the computer, or clone the repository. The app needs **sanitize_pptx.py**, **sanitize_desktop.py**, **Setup Sanitize.bat** and **sanitize.ico**.
-3. Double-click **Setup Sanitize.bat**. It checks Python and puts a **Sanitize** shortcut on the desktop.
+Run **Sanitize Setup.exe**. It needs no admin rights and nothing installed first: Python comes inside it. It installs for the current user into **%LOCALAPPDATA%\Programs\Sanitize** and adds **Sanitize** to the Start menu and, unless unticked, the desktop. Remove it from **Settings > Apps**. To update, run a newer installer: it replaces the installed copy.
 
-There are no packages to install. Run the setup again after moving the folder or reinstalling Python: the shortcut points to both.
+- The installer is not code-signed, so Windows first shows **Windows protected your PC**: choose **More info**, then **Run anyway**. On computers with Smart App Control turned on, Windows blocks it outright until it is signed.
+- IT can install it silently: **"Sanitize Setup.exe" /VERYSILENT** for the signed-in user, or **/VERYSILENT /ALLUSERS** from an administrator prompt for everyone on the computer.
 
-The icon, in light and dark mode alike, is **sanitize.ico**: the app's card with the Prezlab **pl:** logomark, in the brand colors. Its source is **sanitize.svg**. After changing the SVG, run **python build_icon.py** to rebuild the .ico (Microsoft Edge renders each size), then run the setup again so the shortcut shows it.
+### Building the installer
+
+**python build_installer.py** writes **Sanitize Setup.exe** (about 14 MB) one level up, next to this folder: the project folder shows only the installer and **Source**, which holds everything else and is the repository, so the installer is never committed. Rebuild it after changing **sanitize_pptx.py**, **sanitize_desktop.py** or the icon.
+
+- It needs **Inno Setup 6.7** or later (**winget install JRSoftware.InnoSetup**) and is run with 64-bit Python 3.9 or later from **python.org**, with **tcl/tk and IDLE** ticked. That Python goes into the installer without its site-packages, test suite and IDLE, so its programs keep the Python Software Foundation's signature.
+- The installed copy uses only its own Python: other Pythons on the computer, and their packages, can't interfere.
+- **Sanitize.iss** is the Inno Setup script it compiles. Never change its **AppId**: that is what lets a newer installer update an installed copy instead of adding a second one.
+
+To try a change before building, run **pythonw sanitize_desktop.py**.
+
+The icon, in light and dark mode alike, is **sanitize.ico**: the app's card with the Prezlab **pl:** logomark, in the brand colors. Its source is **sanitize.svg**. After changing the SVG, run **python build_icon.py** to rebuild the .ico (Microsoft Edge renders each size), then rebuild the installer, which also renders its wizard images from the SVG.
 
 ## Browser view
 

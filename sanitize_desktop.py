@@ -4,17 +4,16 @@ A small window offers Mask keywords, Mask all and Restore; the new files are sav
 Everything runs on this computer: nothing is sent anywhere, logged or kept. Typed terms are forgotten when the
 window closes, and highlighted previews are temporary copies, deleted when Sanitize starts or closes.
 
-Setup, once per device: double-click "Setup Sanitize.bat" (it runs python sanitize_desktop.py --setup).
+It is installed with "Sanitize Setup.exe", built by build_installer.py, which brings its own copy of Python. To try a
+change before building, run pythonw sanitize_desktop.py.
 """
 
 from __future__ import annotations
 
-import base64
 import ctypes
 import os
 import re
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -447,45 +446,7 @@ class TkUI:
         self._root.destroy()
 
 
-#setup: run once per device by Setup Sanitize.bat
-PS_SHORTCUT = r"""
-$ErrorActionPreference = 'Stop'
-$path = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Sanitize.lnk'
-$s = (New-Object -ComObject WScript.Shell).CreateShortcut($path)
-$s.TargetPath = $env:SAN_PYTHONW
-$s.Arguments = '"' + $env:SAN_SCRIPT + '"'
-$s.WorkingDirectory = $env:SAN_DIR
-if ($env:SAN_ICON) { $s.IconLocation = $env:SAN_ICON + ',0' }
-$s.Description = 'Mask a deck before it goes out, restore it when it comes back'
-$s.Save()
-$path
-"""
-
-
-def setup() -> int:
-    """Put a Sanitize shortcut, with sanitize.ico as its icon, on this user's desktop."""
-    pythonw = Path(sys.executable).with_name("pythonw.exe")
-    if not pythonw.exists():
-        print(f"pythonw.exe was not found next to {sys.executable}. Install Python from python.org, then run the setup again.")
-        return 1
-    if not ICON.exists():
-        print(f"{ICON.name} is missing, so the shortcut gets Python's icon.")
-    env = {**os.environ, "SAN_PYTHONW": str(pythonw), "SAN_SCRIPT": str(Path(__file__).resolve()),
-           "SAN_DIR": str(HERE), "SAN_ICON": str(ICON) if ICON.exists() else ""}
-    script = base64.b64encode(PS_SHORTCUT.encode("utf-16-le")).decode()
-    done = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", script],
-                          env=env, capture_output=True, text=True)
-    if done.returncode:
-        print("Could not create the desktop shortcut.\n" + done.stderr.strip())
-        return 1
-    ctypes.windll.shell32.SHChangeNotify(0x08000000, 0, None, None)  # refresh icons, in case an older one is cached
-    print(f"Shortcut created: {done.stdout.strip()}")
-    return 0
-
-
 def main() -> int:
-    if sys.argv[1:] == ["--setup"]:
-        return setup()
     out_dir = downloads_dir()
     clear_previews()
     ui = TkUI(out_dir)
